@@ -45,7 +45,14 @@ def submit_review(event: str, body: str) -> None:
     pr_number = os.environ["PR_NUMBER"]
     sha = os.environ["HEAD_SHA"]
     url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}/reviews"
-    _gh_post(url, {"event": event, "body": body, "commit_id": sha})
+    try:
+        _gh_post(url, {"event": event, "body": body, "commit_id": sha})
+    except requests.exceptions.HTTPError as e:
+        # Some repo configurations (self-review restrictions, fork PRs, bot limits)
+        # prevent formal review submission. The job exit code already controls
+        # merge blocking, so log the warning and continue rather than crashing.
+        print(f"Warning: could not submit formal review ({e}). "
+              f"PR blocking is still enforced via the workflow job status.")
 
 
 def format_comment(result: dict, config: dict) -> str:

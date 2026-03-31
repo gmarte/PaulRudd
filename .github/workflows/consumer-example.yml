@@ -30,10 +30,10 @@ jobs:
     name: "Paul / AI PR Review"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
 
       - name: Run Paul
-        uses: giancarlopro/paul@v1   # ← update to your fork/org
+        uses: gmarte/PaulRudd@v1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           # Change the secret name below to match the key for your chosen provider:
