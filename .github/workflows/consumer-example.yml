@@ -1,0 +1,44 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Paul — AI PR Review  |  Consumer workflow template
+# ─────────────────────────────────────────────────────────────────────────────
+# Copy this file to .github/workflows/paul.yml in the repos you want reviewed.
+#
+# Setup steps:
+# 1. Add your LLM API key as a repository secret (e.g. ANTHROPIC_API_KEY).
+# 2. Copy .paul.yml.example to .paul.yml in the repo root and customise it.
+# 3. Enable branch protection: require "Paul / AI PR Review" status check.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Paul PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    # Restrict to specific branches (optional — remove to review all PRs):
+    # branches:
+    #   - main
+    #   - master
+    #   - dev
+
+permissions:
+  pull-requests: write
+  contents: read
+  statuses: write
+
+jobs:
+  paul:
+    name: "Paul / AI PR Review"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Paul
+        uses: giancarlopro/paul@v1   # ← update to your fork/org
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Change the secret name below to match the key for your chosen provider:
+          #   Anthropic → ANTHROPIC_API_KEY
+          #   OpenAI    → OPENAI_API_KEY
+          #   Google    → GOOGLE_API_KEY
+          api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # config_path: ".paul.yml"  # default — override if needed

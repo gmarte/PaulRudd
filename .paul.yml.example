@@ -1,0 +1,62 @@
+# Paul PR Review — Per-Repo Configuration
+# Copy this file to .paul.yml in the root of your repository and customise it.
+# All fields are optional — Paul uses sensible defaults for everything.
+
+# ── LLM Configuration ────────────────────────────────────────────────────────
+
+# LLM provider: anthropic | openai | google
+provider: anthropic
+
+# Model to use. Any LiteLLM-compatible model string for the selected provider.
+# Anthropic examples:  claude-sonnet-4-6 | claude-opus-4-6 | claude-haiku-4-5-20251001
+# OpenAI examples:     gpt-4o | gpt-4o-mini | o1-preview
+# Google examples:     gemini-1.5-pro | gemini-1.5-flash
+model: claude-sonnet-4-6
+
+# Maximum tokens in the LLM response.
+max_tokens: 4096
+
+# Temperature (0 = deterministic, best for code review).
+temperature: 0
+
+# ── Review Behaviour ──────────────────────────────────────────────────────────
+
+# Minimum severity that blocks the PR and requests changes.
+# Options: critical | major | minor
+# - "critical": only block for security/data-loss issues
+# - "major":    also block for functional bugs and missing tests (recommended)
+# - "minor":    block for any code quality issues
+severity_threshold: major
+
+# ── File Exclusions ───────────────────────────────────────────────────────────
+
+# Glob patterns for files to skip entirely. Lock files and generated assets
+# are excluded by default — list additional patterns here.
+excluded_paths:
+  - "**/*.lock"
+  - "**/package-lock.json"
+  - "**/yarn.lock"
+  - "**/Pipfile.lock"
+  - "**/poetry.lock"
+  - "**/go.sum"
+  - "**/dist/**"
+  - "**/build/**"
+  - "**/__pycache__/**"
+  - "**/*.pyc"
+  - "**/*.min.js"
+  - "**/*.min.css"
+  # Add repo-specific exclusions below:
+  # - "migrations/**"
+  # - "docs/**"
+
+# ── Custom Instructions ───────────────────────────────────────────────────────
+
+# Freeform text appended to Paul's system prompt.
+# Use this to describe your stack, architecture, and what Paul should focus on.
+# Leave empty to use only the default review criteria.
+custom_instructions: |
+  This is a [describe your stack, e.g. "Python/FastAPI REST API with PostgreSQL"].
+  Pay special attention to:
+  - [Your critical concern #1, e.g. "SQL query safety — prefer the ORM over raw queries"]
+  - [Your critical concern #2, e.g. "Authentication on every endpoint that touches user data"]
+  - [Your critical concern #3, e.g. "Test coverage on business-logic changes"]

@@ -1,0 +1,43 @@
+name: "Paul — AI PR Review"
+description: "Automated PR reviews powered by LLMs with severity-gated approvals. Paul Rudd = PR."
+author: "giancarlopro"
+
+branding:
+  icon: "eye"
+  color: "blue"
+
+inputs:
+  github_token:
+    description: "GitHub token with pull-requests:write, contents:read, statuses:write permissions."
+    required: true
+  api_key:
+    description: "API key for the configured LLM provider (Anthropic, OpenAI, or Google)."
+    required: true
+  config_path:
+    description: "Path to the per-repo config file relative to the repository root."
+    required: false
+    default: ".paul.yml"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install dependencies
+      shell: bash
+      run: pip install -r ${{ github.action_path }}/requirements.txt
+
+    - name: Run Paul
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        PAUL_API_KEY: ${{ inputs.api_key }}
+        PAUL_CONFIG_PATH: ${{ inputs.config_path }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: python ${{ github.action_path }}/src/paul.py
