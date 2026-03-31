@@ -7,7 +7,7 @@ import sys
 
 from config import load_config
 from diff_processor import fetch_diff
-from github_client import format_comment, post_review_comment, set_commit_status, submit_review
+from github_client import format_comment, post_review_comment, submit_review
 from reviewer import determines_outcome, review
 
 
@@ -24,7 +24,6 @@ def main() -> None:
 
     if not diff.strip():
         print("Empty diff — nothing to review. Approving.")
-        set_commit_status("success", "No reviewable changes found.")
         submit_review("APPROVE", "No reviewable changes found (empty diff).")
         return
 
@@ -40,26 +39,18 @@ def main() -> None:
 
     outcome = determines_outcome(overall, config["severity_threshold"])
 
-    # Use a short review body — full details are already in the PR comment above.
+    # Short review body — full details are in the PR comment posted above.
     review_body = (
         f"Paul found {issue_count} issue(s). Highest severity: {overall}. "
-        f"See the review comment above for details."
+        f"See the review comment for details."
     )
 
     if outcome == "block":
         print(f"Blocking PR (severity '{overall}' meets threshold '{config['severity_threshold']}').")
-        set_commit_status(
-            "failure",
-            f"Paul found {issue_count} issue(s) — highest severity: {overall}.",
-        )
         submit_review("REQUEST_CHANGES", review_body)
-        sys.exit(1)
+        sys.exit(1)  # Non-zero exit makes the workflow job fail → blocks the PR
     else:
         print(f"Approving PR (severity '{overall}' is below threshold '{config['severity_threshold']}').")
-        set_commit_status(
-            "success",
-            f"Paul reviewed {issue_count} issue(s) — highest severity: {overall}.",
-        )
         submit_review("APPROVE", review_body)
 
 
