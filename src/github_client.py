@@ -43,8 +43,9 @@ def submit_review(event: str, body: str) -> None:
     """event: 'APPROVE' | 'REQUEST_CHANGES'"""
     repo = os.environ["REPO"]
     pr_number = os.environ["PR_NUMBER"]
+    sha = os.environ["HEAD_SHA"]
     url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}/reviews"
-    _gh_post(url, {"event": event, "body": body})
+    _gh_post(url, {"event": event, "body": body, "commit_id": sha})
 
 
 def format_comment(result: dict, config: dict) -> str:
