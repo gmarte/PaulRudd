@@ -40,13 +40,19 @@ def main() -> None:
 
     outcome = determines_outcome(overall, config["severity_threshold"])
 
+    # Use a short review body — full details are already in the PR comment above.
+    review_body = (
+        f"Paul found {issue_count} issue(s). Highest severity: {overall}. "
+        f"See the review comment above for details."
+    )
+
     if outcome == "block":
         print(f"Blocking PR (severity '{overall}' meets threshold '{config['severity_threshold']}').")
         set_commit_status(
             "failure",
             f"Paul found {issue_count} issue(s) — highest severity: {overall}.",
         )
-        submit_review("REQUEST_CHANGES", comment_body)
+        submit_review("REQUEST_CHANGES", review_body)
         sys.exit(1)
     else:
         print(f"Approving PR (severity '{overall}' is below threshold '{config['severity_threshold']}').")
@@ -54,7 +60,7 @@ def main() -> None:
             "success",
             f"Paul reviewed {issue_count} issue(s) — highest severity: {overall}.",
         )
-        submit_review("APPROVE", comment_body)
+        submit_review("APPROVE", review_body)
 
 
 if __name__ == "__main__":
