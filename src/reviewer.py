@@ -5,6 +5,7 @@ Calls the configured LLM via LiteLLM and parses the structured JSON review respo
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 import litellm
@@ -15,20 +16,32 @@ PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "system_prompt.md"
 SEVERITY_ORDER = ["suggestion", "minor", "major", "critical"]
 
 
+def _completion_with_backoff(**kwargs) -> object:
+    """Call litellm.completion with exponential backoff on server/overload errors."""
+    delays = [5, 15, 30]
+    for attempt, delay in enumerate(delays, 1):
+        try:
+            return litellm.completion(**kwargs)
+        except (litellm.exceptions.InternalServerError, litellm.exceptions.ServiceUnavailableError) as e:
+            if attempt == len(delays):
+                raise
+            print(f"  API overloaded (attempt {attempt}/{len(delays)}), retrying in {delay}s...")
+            time.sleep(delay)
+
+
 def review(diff: str, config: dict) -> dict:
     system_prompt = _build_system_prompt(config)
     _set_api_key_env(config)
 
     model = _resolve_model(config)
 
-    response = litellm.completion(
+    response = _completion_with_backoff(
         model=model,
         messages=[{"role": "user", "content": diff}],
         system=system_prompt,
         max_tokens=config["max_tokens"],
         temperature=config["temperature"],
         response_format={"type": "json_object"},
-        num_retries=3,
     )
 
     raw = response.choices[0].message.content
