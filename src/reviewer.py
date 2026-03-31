@@ -99,7 +99,7 @@ def _parse_response(raw: str) -> dict:
 
 
 def _validate_response(data: dict) -> None:
-    required_fields = {"overall_severity", "summary", "issues"}
+    required_fields = {"overall_severity", "summary", "issues", "changes"}
     missing = required_fields - data.keys()
     if missing:
         raise ValueError(f"LLM response missing required fields: {missing}")

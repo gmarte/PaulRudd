@@ -49,7 +49,7 @@ def submit_review(event: str, body: str) -> None:
 
 def format_comment(result: dict, config: dict) -> str:
     issues = result.get("issues", [])
-    overall = result.get("overall_severity", "suggestion")
+    changes = result.get("changes", [])
     summary = result.get("summary", "")
     model = config.get("model", "unknown model")
 
@@ -58,10 +58,32 @@ def format_comment(result: dict, config: dict) -> str:
         sev = issue.get("severity", "suggestion")
         counts[sev] = counts.get(sev, 0) + 1
 
-    lines = [
-        "## 👨‍⚖️ Paul's Review",
+    lines = ["## 👨‍⚖️ Paul's Review", ""]
+
+    # ── Walkthrough (collapsible) ────────────────────────────────────────────
+    lines += [
+        "<details open>",
+        "<summary>📋 Walkthrough</summary>",
         "",
-        f"**Summary:** {summary}",
+        f"{summary}",
+        "",
+    ]
+
+    if changes:
+        lines += [
+            "**Changes**",
+            "",
+            "| File | Summary |",
+            "|------|---------|",
+        ]
+        for change in changes:
+            f = change.get("file", "")
+            s = change.get("summary", "")
+            lines.append(f"| `{f}` | {s} |")
+        lines.append("")
+
+    lines += [
+        "**Severity Overview**",
         "",
         "| Severity | Count |",
         "|----------|-------|",
@@ -69,26 +91,33 @@ def format_comment(result: dict, config: dict) -> str:
         f"| 🟠 Major | {counts['major']} |",
         f"| 🟡 Minor | {counts['minor']} |",
         f"| 💡 Suggestion | {counts['suggestion']} |",
+        "",
+        "</details>",
+        "",
+        "---",
     ]
 
-    if issues:
-        lines.append("")
-        lines.append("---")
-        for issue in issues:
-            lines.extend(_format_issue(issue))
+    # ── Individual issues ────────────────────────────────────────────────────
+    for issue in issues:
+        lines.extend(_format_issue(issue))
 
+    # ── Test recommendations ─────────────────────────────────────────────────
     test_recs = result.get("test_recommendations", [])
     if test_recs:
-        lines.append("")
-        lines.append("### 🧪 Test Recommendations")
+        lines += ["", "### 🧪 Test Recommendations", ""]
         for rec in test_recs:
             lines.append(f"- {rec}")
 
-    lines.extend([
+    # ── Combined AI agent prompt (collapsible) ───────────────────────────────
+    if issues:
+        lines += ["", "---", ""]
+        lines += _format_combined_agent_prompt(issues)
+
+    lines += [
         "",
         "---",
-        f"*Powered by [Paul](https://github.com/giancarlopro/paul) · Model: `{model}`*",
-    ])
+        f"*Powered by [Paul](https://github.com/gmarte/PaulRudd) · Model: `{model}`*",
+    ]
 
     return "\n".join(lines)
 
@@ -103,22 +132,17 @@ def _format_issue(issue: dict) -> list:
 
     if line_start and line_end and line_start != line_end:
         location = f"`{file_ref}:{line_start}-{line_end}`"
-        line_ref = f"lines {line_start}–{line_end}"
     elif line_start:
         location = f"`{file_ref}:{line_start}`"
-        line_ref = f"line {line_start}"
     else:
         location = f"`{file_ref}`"
-        line_ref = "the affected area"
 
     title = issue.get("title", "")
     description = issue.get("description", "")
     impact = issue.get("impact", "")
     suggestion = issue.get("suggestion", {})
     explanation = suggestion.get("explanation", "")
-    autofix = suggestion.get("autofix", {})
 
-    # Human-readable section
     lines = [
         "",
         f"### {emoji} [{label}] {title} — {location}",
@@ -129,63 +153,67 @@ def _format_issue(issue: dict) -> list:
     if explanation:
         lines.append(f"**Fix:** {explanation}")
 
-    # AI agent prompt — copy-paste into Claude Code / Cursor
-    agent_prompt = _build_agent_prompt(file_ref, line_ref, title, description, explanation, autofix)
-    lines.append("")
-    lines.append("<details>")
-    lines.append("<summary>📋 Copy prompt for AI agent (Claude Code / Cursor)</summary>")
-    lines.append("")
-    lines.append("```")
-    lines.append(agent_prompt)
-    lines.append("```")
-    lines.append("")
-    lines.append("</details>")
-
     return lines
 
 
-def _build_agent_prompt(file_ref: str, line_ref: str, title: str, description: str, explanation: str, autofix: dict) -> str:
-    parts = [
-        f"Fix the following issue in `{file_ref}` at {line_ref}.",
+def _format_combined_agent_prompt(issues: list) -> list:
+    """Single collapsible block with a ready-to-paste prompt covering all issues."""
+    prompt_lines = [
+        "You are fixing issues flagged by Paul, an AI PR reviewer.",
+        "Please fix each of the following issues in the codebase:",
         "",
-        f"Issue: {title}",
-        f"Problem: {description}",
     ]
 
-    if explanation:
-        parts += ["", f"How to fix: {explanation}"]
+    for i, issue in enumerate(issues, 1):
+        file_ref = issue.get("file", "unknown")
+        line_start = issue.get("line_start")
+        line_end = issue.get("line_end")
+        title = issue.get("title", "")
+        description = issue.get("description", "")
+        suggestion = issue.get("suggestion", {})
+        explanation = suggestion.get("explanation", "")
+        autofix = suggestion.get("autofix") or {}
+        original = autofix.get("original", "")
+        replacement = autofix.get("replacement", "")
 
-    original = autofix.get("original", "")
-    replacement = autofix.get("replacement", "")
+        if line_start and line_end and line_start != line_end:
+            line_ref = f"lines {line_start}–{line_end}"
+        elif line_start:
+            line_ref = f"line {line_start}"
+        else:
+            line_ref = "the affected area"
 
-    if original and replacement:
-        parts += [
-            "",
-            "Replace this:",
-            "```",
-            original,
-            "```",
-            "",
-            "With this:",
-            "```",
-            replacement,
-            "```",
-        ]
-    elif original:
-        parts += [
-            "",
-            "The problematic code:",
-            "```",
-            original,
-            "```",
-        ]
+        prompt_lines += [f"── Issue {i}: {title}", f"   File: {file_ref} ({line_ref})"]
+        if description:
+            prompt_lines.append(f"   Problem: {description}")
+        if explanation:
+            prompt_lines.append(f"   How to fix: {explanation}")
+        if original and replacement:
+            prompt_lines += [
+                "   Replace this:",
+                f"   {original}",
+                "   With this:",
+                f"   {replacement}",
+            ]
+        prompt_lines.append("")
 
-    parts += [
+    prompt_lines.append(
+        "After all fixes are applied, run the existing test suite and flag any tests "
+        "that need updating. Add new tests where noted."
+    )
+
+    combined = "\n".join(prompt_lines)
+
+    return [
+        "<details>",
+        "<summary>🤖 Prompt for all issues — paste into Claude Code or Cursor to fix everything at once</summary>",
         "",
-        "After making the change, verify the fix does not break existing tests and consider adding a test that would have caught this issue.",
+        "```",
+        combined,
+        "```",
+        "",
+        "</details>",
     ]
-
-    return "\n".join(parts)
 
 
 def _gh_post(url: str, payload: dict) -> requests.Response:

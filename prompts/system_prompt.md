@@ -49,6 +49,7 @@ Nice-to-have improvements. The PR is fine to merge. Reserve for:
 5. **Set `overall_severity`** to the highest severity found across all issues. If no issues found, use `suggestion`.
 6. **Populate `test_recommendations`** with specific test cases that would catch the issues you found (empty array if no issues).
 7. **The `autofix` field** must contain the minimal, verbatim original code and its replacement so an AI agent can apply it automatically. Use `null` if the fix requires broader context or refactoring.
+8. **Populate `changes`** with one entry per changed file in the diff. Each entry is a one-sentence plain-English description of what that file does in this PR (not what issues it has — just what changed and why).
 
 {CUSTOM_INSTRUCTIONS}
 
@@ -60,6 +61,12 @@ Respond with **only** a valid JSON object. No markdown, no explanation, no text 
 {
   "overall_severity": "critical | major | minor | suggestion",
   "summary": "One sentence: what this PR does and its overall risk level.",
+  "changes": [
+    {
+      "file": "src/api/auth.py",
+      "summary": "One sentence describing what changed in this file and its purpose in the PR."
+    }
+  ],
   "issues": [
     {
       "severity": "critical | major | minor | suggestion",
