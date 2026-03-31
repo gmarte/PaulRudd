@@ -103,18 +103,22 @@ def _format_issue(issue: dict) -> list:
 
     if line_start and line_end and line_start != line_end:
         location = f"`{file_ref}:{line_start}-{line_end}`"
+        line_ref = f"lines {line_start}–{line_end}"
     elif line_start:
         location = f"`{file_ref}:{line_start}`"
+        line_ref = f"line {line_start}"
     else:
         location = f"`{file_ref}`"
+        line_ref = "the affected area"
 
     title = issue.get("title", "")
     description = issue.get("description", "")
     impact = issue.get("impact", "")
     suggestion = issue.get("suggestion", {})
     explanation = suggestion.get("explanation", "")
-    code = suggestion.get("code", "")
+    autofix = suggestion.get("autofix", {})
 
+    # Human-readable section
     lines = [
         "",
         f"### {emoji} [{label}] {title} — {location}",
@@ -124,10 +128,64 @@ def _format_issue(issue: dict) -> list:
     lines.append(f"**Description:** {description}")
     if explanation:
         lines.append(f"**Fix:** {explanation}")
-    if code:
-        lines.append(code)
+
+    # AI agent prompt — copy-paste into Claude Code / Cursor
+    agent_prompt = _build_agent_prompt(file_ref, line_ref, title, description, explanation, autofix)
+    lines.append("")
+    lines.append("<details>")
+    lines.append("<summary>📋 Copy prompt for AI agent (Claude Code / Cursor)</summary>")
+    lines.append("")
+    lines.append("```")
+    lines.append(agent_prompt)
+    lines.append("```")
+    lines.append("")
+    lines.append("</details>")
 
     return lines
+
+
+def _build_agent_prompt(file_ref: str, line_ref: str, title: str, description: str, explanation: str, autofix: dict) -> str:
+    parts = [
+        f"Fix the following issue in `{file_ref}` at {line_ref}.",
+        "",
+        f"Issue: {title}",
+        f"Problem: {description}",
+    ]
+
+    if explanation:
+        parts += ["", f"How to fix: {explanation}"]
+
+    original = autofix.get("original", "")
+    replacement = autofix.get("replacement", "")
+
+    if original and replacement:
+        parts += [
+            "",
+            "Replace this:",
+            "```",
+            original,
+            "```",
+            "",
+            "With this:",
+            "```",
+            replacement,
+            "```",
+        ]
+    elif original:
+        parts += [
+            "",
+            "The problematic code:",
+            "```",
+            original,
+            "```",
+        ]
+
+    parts += [
+        "",
+        "After making the change, verify the fix does not break existing tests and consider adding a test that would have caught this issue.",
+    ]
+
+    return "\n".join(parts)
 
 
 def _gh_post(url: str, payload: dict) -> requests.Response:
