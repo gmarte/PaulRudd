@@ -62,7 +62,7 @@ def format_comment(result: dict, config: dict) -> str:
 
     # ── Walkthrough (collapsible) ────────────────────────────────────────────
     lines += [
-        "<details open>",
+        "<details>",
         "<summary>📋 Walkthrough</summary>",
         "",
         f"{summary}",
@@ -143,15 +143,24 @@ def _format_issue(issue: dict) -> list:
     suggestion = issue.get("suggestion", {})
     explanation = suggestion.get("explanation", "")
 
+    summary_line = f"{emoji} [{label}] {title} — {location}"
+
+    body = []
+    if impact:
+        body.append(f"**Impact:** {impact}")
+    body.append(f"**Description:** {description}")
+    if explanation:
+        body.append(f"**Fix:** {explanation}")
+
     lines = [
         "",
-        f"### {emoji} [{label}] {title} — {location}",
+        "<details>",
+        f"<summary>{summary_line}</summary>",
+        "",
+    ] + body + [
+        "",
+        "</details>",
     ]
-    if impact:
-        lines.append(f"**Impact:** {impact}")
-    lines.append(f"**Description:** {description}")
-    if explanation:
-        lines.append(f"**Fix:** {explanation}")
 
     return lines
 
