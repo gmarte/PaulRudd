@@ -18,7 +18,7 @@ SEVERITY_ORDER = ["suggestion", "minor", "major", "critical"]
 
 def _completion_with_backoff(**kwargs) -> object:
     """Call litellm.completion with exponential backoff on server/overload errors."""
-    delays = [5, 15, 30]
+    delays = [30, 60, 120]
     for attempt, delay in enumerate(delays, 1):
         try:
             return litellm.completion(**kwargs)

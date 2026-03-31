@@ -5,6 +5,8 @@ Orchestrates: load config → fetch diff → call LLM → post results to GitHub
 
 import sys
 
+import litellm
+
 from config import load_config
 from diff_processor import fetch_diff
 from github_client import format_comment, post_review_comment, submit_review
@@ -28,7 +30,11 @@ def main() -> None:
         return
 
     print("Calling LLM for review...")
-    result = review(diff, config)
+    try:
+        result = review(diff, config)
+    except (litellm.exceptions.InternalServerError, litellm.exceptions.ServiceUnavailableError):
+        print("API unavailable after all retries — skipping review.")
+        sys.exit(0)
     overall = result["overall_severity"]
     issue_count = len(result.get("issues", []))
     print(f"  Overall severity: {overall} | Issues found: {issue_count}")
