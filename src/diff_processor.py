@@ -62,6 +62,10 @@ def _split_into_file_blocks(diff: str) -> list:
     return blocks
 
 
+# Public alias used by reviewer.py for the two-pass pipeline
+split_into_file_blocks = _split_into_file_blocks
+
+
 def _extract_path(diff_header: str) -> str:
     """Extract 'b/src/foo.py' → 'src/foo.py' from a diff header line."""
     match = re.search(r" b/(.+)$", diff_header.strip())

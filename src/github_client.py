@@ -1,5 +1,6 @@
 """
-GitHub API interactions: post review comment, set commit status, submit review event.
+GitHub API interactions: post review comment, set commit status, submit review.
+Supports the two-pass pipeline with post_walkthrough_comment + edit_comment.
 """
 
 import os
@@ -20,11 +21,36 @@ SEVERITY_LABEL = {
 }
 
 
+# ── Posting ──────────────────────────────────────────────────────────────────
+
 def post_review_comment(body: str) -> None:
     repo = os.environ["REPO"]
     pr_number = os.environ["PR_NUMBER"]
     url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
     _gh_post(url, {"body": body})
+
+
+def post_walkthrough_comment(body: str) -> int:
+    """Post the walkthrough comment and return the GitHub comment ID for later editing."""
+    repo = os.environ["REPO"]
+    pr_number = os.environ["PR_NUMBER"]
+    url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
+    response = _gh_post(url, {"body": body})
+    return response.json()["id"]
+
+
+def edit_comment(comment_id: int, body: str) -> None:
+    """Replace the body of an existing comment (used to update walkthrough → full review)."""
+    repo = os.environ["REPO"]
+    url = f"https://api.github.com/repos/{repo}/issues/comments/{comment_id}"
+    token = os.environ["GITHUB_TOKEN"]
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "Content-Type": "application/json",
+    }
+    response = requests.patch(url, json={"body": body}, headers=headers, timeout=30)
+    response.raise_for_status()
 
 
 def set_commit_status(state: str, description: str) -> None:
@@ -53,6 +79,54 @@ def submit_review(event: str, body: str) -> None:
         # merge blocking, so log the warning and continue rather than crashing.
         print(f"Warning: could not submit formal review ({e}). "
               f"PR blocking is still enforced via the workflow job status.")
+
+
+# ── Formatting ───────────────────────────────────────────────────────────────
+
+def format_walkthrough(walkthrough: dict, config: dict) -> str:
+    """
+    Render the walkthrough-only comment posted immediately after Pass 1.
+    A 'Reviewing issues...' notice signals that the comment will update shortly.
+    """
+    summary = walkthrough.get("summary", "")
+    changes = walkthrough.get("changes", [])
+    model = config.get("model", "unknown model")
+
+    lines = ["## 👨‍⚖️ Paul's Review", ""]
+
+    lines += [
+        "<details open>",
+        "<summary>📋 Walkthrough</summary>",
+        "",
+        f"{summary}",
+        "",
+    ]
+
+    if changes:
+        lines += [
+            "**Changes**",
+            "",
+            "| File | Summary |",
+            "|------|---------|",
+        ]
+        for change in changes:
+            f = change.get("file", "")
+            s = change.get("summary", "")
+            lines.append(f"| `{f}` | {s} |")
+        lines.append("")
+
+    lines += [
+        "</details>",
+        "",
+        "---",
+        "",
+        "*🔄 Reviewing issues file by file… this comment will update shortly.*",
+        "",
+        "---",
+        f"*Powered by [Paul](https://github.com/gmarte/PaulRudd) · Model: `{model}`*",
+    ]
+
+    return "\n".join(lines)
 
 
 def format_comment(result: dict, config: dict) -> str:

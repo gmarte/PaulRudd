@@ -9,7 +9,7 @@ import yaml
 DEFAULTS = {
     "provider": "anthropic",
     "model": "claude-sonnet-4-6",
-    "max_tokens": 4096,
+    "max_tokens": 32768,
     "temperature": 0,
     "severity_threshold": "major",  # critical | major | minor
     "excluded_paths": [
