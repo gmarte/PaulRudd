@@ -52,14 +52,17 @@ def review_walkthrough(diff: str, config: dict) -> dict:
     _set_api_key_env(config)
     model = _resolve_model(config)
 
-    response = _completion_with_backoff(
-        model=model,
-        messages=[{"role": "user", "content": diff}],
-        system=system_prompt,
-        max_tokens=2048,  # Walkthrough schema is tiny; hard cap keeps cost low
-        temperature=config["temperature"],
-        response_format={"type": "json_object"},
-    )
+    kwargs = {
+        "model": model,
+        "messages": [{"role": "user", "content": diff}],
+        "system": system_prompt,
+        "max_tokens": 2048,  # Walkthrough schema is tiny; hard cap keeps cost low
+        "response_format": {"type": "json_object"},
+    }
+    if _supports_temperature(model):
+        kwargs["temperature"] = config["temperature"]
+
+    response = _completion_with_backoff(**kwargs)
 
     raw = response.choices[0].message.content
     return _parse_walkthrough(raw)
@@ -77,14 +80,17 @@ def review_file(file_path: str, file_diff: str, config: dict) -> dict:
 
     user_content = f"File: {file_path}\n\n{file_diff}"
 
-    response = _completion_with_backoff(
-        model=model,
-        messages=[{"role": "user", "content": user_content}],
-        system=system_prompt,
-        max_tokens=config["max_tokens"],
-        temperature=config["temperature"],
-        response_format={"type": "json_object"},
-    )
+    kwargs = {
+        "model": model,
+        "messages": [{"role": "user", "content": user_content}],
+        "system": system_prompt,
+        "max_tokens": config["max_tokens"],
+        "response_format": {"type": "json_object"},
+    }
+    if _supports_temperature(model):
+        kwargs["temperature"] = config["temperature"]
+
+    response = _completion_with_backoff(**kwargs)
 
     raw = response.choices[0].message.content
     return _parse_file_review(raw)
@@ -140,6 +146,11 @@ def _build_prompt(path: Path, config: dict) -> str:
     custom = config.get("custom_instructions", "").strip()
     injection = f"\n## Repo-Specific Instructions\n\n{custom}\n" if custom else ""
     return template.replace("{CUSTOM_INSTRUCTIONS}", injection)
+
+
+def _supports_temperature(model: str) -> bool:
+    """Claude 4+ models deprecated the temperature parameter."""
+    return not re.search(r"claude-\w+-4-\d", model)
 
 
 def _resolve_model(config: dict) -> str:
