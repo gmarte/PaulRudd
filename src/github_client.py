@@ -92,7 +92,9 @@ def format_walkthrough(walkthrough: dict, config: dict) -> str:
     changes = walkthrough.get("changes", [])
     model = config.get("model", "unknown model")
 
-    lines = ["## 👨‍⚖️ Paul's Review", ""]
+    lines = ["<p align="center"><img src="https://raw.githubusercontent.com/gmarte/PaulRudd/master/assets/paul.jpg" width="280" /></p>
+
+## Paul's Review", ""]
 
     lines += [
         "<details open>",
@@ -140,7 +142,9 @@ def format_comment(result: dict, config: dict) -> str:
         sev = issue.get("severity", "suggestion")
         counts[sev] = counts.get(sev, 0) + 1
 
-    lines = ["## 👨‍⚖️ Paul's Review", ""]
+    lines = ["<p align="center"><img src="https://raw.githubusercontent.com/gmarte/PaulRudd/master/assets/paul.jpg" width="280" /></p>
+
+## Paul's Review", ""]
 
     # ── Walkthrough (collapsible) ────────────────────────────────────────────
     lines += [
