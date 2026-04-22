@@ -64,6 +64,9 @@ def main() -> None:
         except (litellm.exceptions.InternalServerError, litellm.exceptions.ServiceUnavailableError):
             print(f"    API unavailable for {file_path} — skipping file.")
             continue
+        except ValueError as e:
+            print(f"    Skipping {file_path}: {e}")
+            continue
         all_issues.extend(result.get("issues", []))
         all_test_recs.extend(result.get("test_recommendations", []))
 
