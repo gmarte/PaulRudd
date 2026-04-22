@@ -143,9 +143,23 @@ def determines_outcome(overall_severity: str, threshold: str) -> str:
 
 def _build_prompt(path: Path, config: dict) -> str:
     template = path.read_text(encoding="utf-8")
+
+    repo_ctx = config.get("repo_context", "").strip()
+    ctx_block = (
+        f"\n## Codebase Context\n\n"
+        f"The following files describe this repo's conventions and rules. "
+        f"Use them to avoid suggesting changes that conflict with established patterns.\n\n"
+        f"{repo_ctx}\n"
+    ) if repo_ctx else ""
+
     custom = config.get("custom_instructions", "").strip()
-    injection = f"\n## Repo-Specific Instructions\n\n{custom}\n" if custom else ""
-    return template.replace("{CUSTOM_INSTRUCTIONS}", injection)
+    custom_block = f"\n## Repo-Specific Instructions\n\n{custom}\n" if custom else ""
+
+    return (
+        template
+        .replace("{REPO_CONTEXT}", ctx_block)
+        .replace("{CUSTOM_INSTRUCTIONS}", custom_block)
+    )
 
 
 def _supports_temperature(model: str) -> bool:

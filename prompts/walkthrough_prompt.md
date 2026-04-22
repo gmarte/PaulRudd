@@ -15,6 +15,7 @@ Read the diff and produce a **high-level walkthrough only**. Do NOT list individ
 - **minor** — Code quality, naming, documentation issues
 - **suggestion** — Style, optional refactors, micro-optimisations
 
+{REPO_CONTEXT}
 {CUSTOM_INSTRUCTIONS}
 
 ## Output Format

@@ -3,6 +3,7 @@ Loads and validates the .paul.yml configuration from the target repository works
 Falls back to safe defaults if the file is absent or a field is missing.
 """
 
+import glob as glob_module
 import os
 import yaml
 
@@ -32,6 +33,26 @@ DEFAULTS = {
 VALID_PROVIDERS = {"anthropic", "openai", "google"}
 VALID_SEVERITIES = {"critical", "major", "minor"}
 
+_CONTEXT_FILES = ["CLAUDE.md", "README.md"]
+_AGENTS_RULES_GLOB = ".agents/rules/*.md"
+_MAX_FILE_CHARS = 8000
+
+
+def read_repo_context() -> str:
+    """Read CLAUDE.md, README.md, and .agents/rules/*.md from the workspace."""
+    parts = []
+
+    for fname in _CONTEXT_FILES:
+        if os.path.exists(fname):
+            content = open(fname, encoding="utf-8").read(_MAX_FILE_CHARS)
+            parts.append(f"### {fname}\n\n{content}")
+
+    for fpath in sorted(glob_module.glob(_AGENTS_RULES_GLOB)):
+        content = open(fpath, encoding="utf-8").read(_MAX_FILE_CHARS)
+        parts.append(f"### {fpath}\n\n{content}")
+
+    return "\n\n---\n\n".join(parts)
+
 
 def load_config() -> dict:
     config_path = os.environ.get("PAUL_CONFIG_PATH", ".paul.yml")
@@ -44,6 +65,7 @@ def load_config() -> dict:
         config.update({k: v for k, v in user_config.items() if v is not None})
 
     _validate(config)
+    config["repo_context"] = read_repo_context()
     return config
 
 

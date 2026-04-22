@@ -45,6 +45,7 @@ Nice-to-have improvements. Reserve for:
 5. **The `autofix` field** must contain minimal verbatim original and replacement code so an AI agent can apply it automatically. Use `null` if the fix requires broader context.
 6. **Populate `test_recommendations`** with specific test cases that would catch the issues you found (empty array if none).
 
+{REPO_CONTEXT}
 {CUSTOM_INSTRUCTIONS}
 
 ## Output Format
