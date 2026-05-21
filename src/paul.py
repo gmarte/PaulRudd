@@ -18,6 +18,8 @@ from github_client import (
     format_walkthrough,
     post_walkthrough_comment,
     submit_review,
+    get_previous_reviews,
+    format_previous_reviews,
 )
 from reviewer import SEVERITY_ORDER, determines_outcome, review_file, review_walkthrough
 
@@ -28,6 +30,11 @@ def main() -> None:
     config = load_config()
     print(f"  Provider: {config['provider']} | Model: {config['model']}")
     print(f"  Severity threshold: {config['severity_threshold']}")
+
+    # Fetch previous review comments
+    prev_comments = get_previous_reviews()
+    config["previous_reviews"] = format_previous_reviews(prev_comments)
+
 
     print("Fetching PR diff...")
     diff = fetch_diff(config)

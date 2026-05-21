@@ -155,10 +155,20 @@ def _build_prompt(path: Path, config: dict) -> str:
     custom = config.get("custom_instructions", "").strip()
     custom_block = f"\n## Repo-Specific Instructions\n\n{custom}\n" if custom else ""
 
+    prev_reviews = config.get("previous_reviews", "").strip()
+    prev_block = (
+        f"\n## Previous Review Comments\n\n"
+        f"The following is the latest review comment you posted on this PR. "
+        f"Use it to understand what issues were flagged in the past. If a new commit has resolved "
+        f"any of these issues, acknowledge it in Spanish (e.g. 'Atendido en el commit [hash]') "
+        f"and do not report it as an active issue again:\n\n"
+        f"{prev_reviews}\n"
+    ) if prev_reviews else ""
+
     return (
         template
         .replace("{REPO_CONTEXT}", ctx_block)
-        .replace("{CUSTOM_INSTRUCTIONS}", custom_block)
+        .replace("{CUSTOM_INSTRUCTIONS}", custom_block + prev_block)
     )
 
 

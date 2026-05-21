@@ -317,3 +317,49 @@ def _gh_post(url: str, payload: dict) -> requests.Response:
     response = requests.post(url, json=payload, headers=headers, timeout=30)
     response.raise_for_status()
     return response
+
+
+def _gh_get(url: str) -> requests.Response:
+    token = os.environ["GITHUB_TOKEN"]
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+    response = requests.get(url, headers=headers, timeout=30)
+    response.raise_for_status()
+    return response
+
+
+def get_previous_reviews() -> list:
+    """Fetch previous review comments posted by Paul on this PR."""
+    repo = os.environ.get("REPO")
+    pr_number = os.environ.get("PR_NUMBER")
+    if not repo or not pr_number:
+        return []
+    url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
+    try:
+        response = _gh_get(url)
+        comments = response.json()
+        paul_comments = []
+        for comment in comments:
+            body = comment.get("body", "")
+            if "Powered by Paul" in body or "Paul's Review" in body:
+                paul_comments.append(body)
+        # Return only the last one (most recent) to save token budget
+        if paul_comments:
+            return [paul_comments[-1]]
+        return []
+    except Exception as e:
+        print(f"Warning: could not fetch previous reviews ({e})")
+        return []
+
+
+def format_previous_reviews(comments: list) -> str:
+    """Format previous review comments into a string for LLM context."""
+    if not comments:
+        return ""
+    formatted = []
+    for idx, comment in enumerate(comments, 1):
+        formatted.append(f"--- Previous Review #{idx} ---\n{comment}")
+    return "\n\n".join(formatted)
+
