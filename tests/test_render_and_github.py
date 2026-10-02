@@ -118,6 +118,19 @@ def test_huge_reviews_stay_under_the_comment_limit():
     assert "| 🟠 Major | 300 |" in body   # R11: counts cover every finding, not just those shown
 
 
+def test_busy_reviews_keep_details_for_blocking_findings():
+    # Live run on a 25-file PR: 42 findings made the comment drop every explanation,
+    # although only the minor ones needed collapsing.
+    verbose = {"description": "Explicación detallada. " * 60, "impact": "Impacto. " * 30}
+    issues = ([_issue(f"Major {i}", "major", line=i, **verbose) for i in range(14)]
+              + [_issue(f"Minor {i}", "minor", line=100 + i, **verbose) for i in range(28)])
+    body = render.format_comment(_result(issues), _ctx("block"))
+    assert len(body) <= render.MAX_COMMENT_CHARS
+    assert body.count("<summary>🟠 [Major]") == 14          # blocking findings keep their details
+    assert "**Other findings**" in body and body.count("- 🟡 [Minor]") == 28
+    assert "Prompt for the blocking issues" in body
+
+
 def test_not_reviewed_files_are_listed_with_reasons():
     ctx = _ctx("fail")
     ctx["coverage"].fail("big.sql", "too_large")

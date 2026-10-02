@@ -64,6 +64,8 @@ runs:
         PAUL_PYTHON: ${{ steps.deps.outputs.python }}
         PAUL_SRC: ${{ github.action_path }}/src
         PYTHONUTF8: "1"
+        # Stream the log as the review goes instead of all at once at the end.
+        PYTHONUNBUFFERED: "1"
         # Use the model map bundled with the pinned LiteLLM instead of fetching one at startup.
         LITELLM_LOCAL_MODEL_COST_MAP: "True"
       run: '"$PAUL_PYTHON" "$PAUL_SRC/paul.py"'
