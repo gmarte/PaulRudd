@@ -212,7 +212,7 @@ Coverage: 3 of 3 file(s) with changes reviewed · skipped: 1 matches excluded_pa
 ▸ Skipped files · Review details (config, model, commit, tokens incl. cache reads)
 ```
 
-Files that couldn't be reviewed appear in a warning block at the top. Hidden markers let the next run find the comment and tell the model what it reported before.
+Files that couldn't be reviewed appear in a warning block at the top. Hidden markers let the next run find the comment and tell the model what it reported before. A finding shows as resolved only when the model says the new diff fixes it **and** that file's diff changed since the review that reported it; in an unchanged file it stays on record.
 
 ---
 

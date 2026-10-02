@@ -8,6 +8,7 @@ reason it wasn't.
 """
 
 import fnmatch
+import hashlib
 import re
 from dataclasses import dataclass
 
@@ -85,6 +86,11 @@ def skip_reason(change: FileChange, path_filter: PathFilter) -> str | None:
     if not change.patch.strip():
         return "renamed" if change.status == "renamed" else "no_changes"
     return None
+
+
+def patch_fingerprint(patch: str) -> str:
+    """A short hash of a file's diff, to tell on the next run whether the file changed."""
+    return hashlib.sha1(patch.encode("utf-8", errors="replace")).hexdigest()[:12]
 
 
 def file_table(changes: list) -> str:
