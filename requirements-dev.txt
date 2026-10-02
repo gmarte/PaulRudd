@@ -1,0 +1,2 @@
+# Test-only dependencies. The runtime dependencies come from requirements.lock.
+pytest==9.1.1

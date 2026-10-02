@@ -1,9 +1,6 @@
 # Claude Code local settings
 .claude/
 
-# Original spec file
-system_prompt.md
-
 # Python
 __pycache__/
 *.pyc

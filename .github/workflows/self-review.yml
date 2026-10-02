@@ -1,0 +1,33 @@
+# Paul reviews its own PRs with the code on the PR branch (uses: ./), so every
+# change to Paul runs on a real PR before it is released. Because the PR
+# supplies the code that reviews it, this is a smoke test, not a merge gate.
+name: Paul self-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: paul-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  paul:
+    name: "Paul / AI PR Review"
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      # The checkout is only needed so `uses: ./` can find action.yml.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run Paul (this branch)
+        uses: ./
+        with:
+          api_key: ${{ secrets.ANTHROPIC_API_KEY }}

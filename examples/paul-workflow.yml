@@ -5,37 +5,55 @@
 #
 # Setup steps:
 # 1. Add your LLM API key as a repository secret (e.g. ANTHROPIC_API_KEY).
-# 2. Copy .paul.yml.example to .paul.yml in the repo root and customise it.
-# 3. Enable branch protection: require "Paul / AI PR Review" status check.
+# 2. Optionally copy .paul.yml.example to .paul.yml in the repo root and
+#    customise it. Paul reads it from the PR's base branch, so a change to it
+#    applies once it is merged.
+# 3. Enable branch protection: require the "Paul / AI PR Review" status check.
+# 4. Protect this workflow file too (see "Hardening the gate" in Paul's README):
+#    a PR runs its own copy of it, so without a code-owner review a PR could
+#    edit the job away.
+#
+# No checkout step is needed: Paul reads the diff and the config through the
+# GitHub API, so the PR's code never lands on the runner.
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Paul PR Review
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review]
     # Restrict to specific branches (optional — remove to review all PRs):
     # branches:
     #   - main
     #   - master
     #   - dev
+  # Only needed if you use a merge queue: the required check must report there
+  # too. The job below is skipped (which counts as passing) for queue runs,
+  # because the PR was already reviewed.
+  merge_group:
 
 permissions:
-  pull-requests: write
   contents: read
-  statuses: write
+  pull-requests: write
+
+# A new push cancels the review still running for the previous one.
+concurrency:
+  group: paul-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   paul:
     name: "Paul / AI PR Review"
+    # Drafts are reviewed when they are marked ready for review.
+    if: ${{ github.event_name == 'pull_request' && !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
+    # Paul stops itself before this (time_budget_minutes, 45 by default) and
+    # reports any files it didn't get to.
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4.2.2
-
       - name: Run Paul
-        uses: gmarte/PaulRudd@v1
+        uses: gmarte/PaulRudd@v2  # or pin a full commit SHA
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
           # Change the secret name below to match the key for your chosen provider:
           #   Anthropic → ANTHROPIC_API_KEY
           #   OpenAI    → OPENAI_API_KEY
