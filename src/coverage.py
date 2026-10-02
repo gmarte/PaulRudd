@@ -29,6 +29,7 @@ FAIL_LABELS = {
     "refused": "LLM declined to review it",
     "llm_rejected": "LLM rejected the request",
     "time_budget": "time_budget_minutes ran out before this file",
+    "budget": "budget limit reached (budget.max_files or budget.max_cost_usd)",
 }
 
 

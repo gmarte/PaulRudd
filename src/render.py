@@ -129,6 +129,34 @@ def review_body(result: dict, ctx: dict) -> str:
     )
 
 
+def step_summary(ctx: dict, outputs: dict, hit_ratio: float) -> str:
+    """A short report for the job's summary page ($GITHUB_STEP_SUMMARY)."""
+    verdict = {
+        "pass": "✅ No blocking issues",
+        "block": "🔴 Changes needed",
+        "fail": "⚠️ Incomplete: files could not be reviewed",
+        "neutral": "⚠️ Incomplete, passing (on_incomplete: neutral)",
+        "error": "❌ Paul could not complete the review",
+    }.get(outputs["verdict"], outputs["verdict"])
+    lines = [
+        "### Paul's review",
+        "",
+        f"**{verdict}**",
+        "",
+        "| | |",
+        "|---|---|",
+        f"| Findings | {outputs['findings']} (highest: {outputs['highest_severity'] or 'none'}) |",
+        f"| Files | {outputs['reviewed_files']} reviewed · {outputs['skipped_files']} skipped · "
+        f"{outputs['failed_files']} not reviewed |",
+        f"| Prompt cache | {hit_ratio:.0%} of input tokens read from cache |",
+    ]
+    if outputs["cost_usd"]:
+        lines.append(f"| Estimated cost | ${float(outputs['cost_usd']):.2f} |")
+    if outputs["comment_url"]:
+        lines += ["", f"[Review comment]({outputs['comment_url']})"]
+    return "\n".join(lines) + "\n"
+
+
 def code_span(text) -> str:
     """Text as an inline code span that nothing inside it can break out of."""
     return f"`{_code(text)}`"
@@ -391,9 +419,10 @@ def _details_section(ctx: dict) -> list:
     if ctx.get("head_sha"):
         lines.append(f"- **Commit:** {code_span(ctx['head_sha'][:7])}")
     if usage.get("calls"):
+        cost = f" · ≈ ${usage['cost_usd']:.2f}" if usage.get("cost_known") else ""
         lines.append(
             f"- **Tokens:** {usage['input_tokens']:,} in ({usage['cache_read_tokens']:,} read from cache) · "
-            f"{usage['output_tokens']:,} out · {usage['calls']} LLM call(s)"
+            f"{usage['output_tokens']:,} out · {usage['calls']} LLM call(s){cost}"
         )
     if ctx.get("run_url"):
         lines.append(f"- **Run:** [logs]({ctx['run_url']})")

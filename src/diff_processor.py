@@ -19,7 +19,10 @@ from config import DEFAULT_EXCLUDED_DIRS, DEFAULT_EXCLUDED_FILES
 
 MAX_FILE_PATCH_CHARS = 60_000   # patches above this are reviewed in parts
 MAX_PART_CHARS = 40_000         # target size of each part of a split patch
-MAX_WALKTHROUGH_CHARS = 80_000  # diff budget for the Pass 1 walkthrough
+MAX_WALKTHROUGH_CHARS = 80_000  # diff budget for the Pass 1 walkthrough in compact mode
+MAX_FULL_FILE_LINES = 1500      # longer files are shown as windows around their hunks
+_FILE_WINDOW_LINES = 60         # lines of context on each side of a hunk in a windowed file
+CHARS_PER_TOKEN = 3.5           # a conservative estimate for code
 
 _HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 _STATUS_LETTER = {"added": "A", "removed": "D", "modified": "M", "renamed": "R", "copied": "C"}
@@ -187,6 +190,58 @@ def split_in_two(patch: str) -> list:
         if size >= half:
             break
     return ["".join(hunks[:i]), "".join(hunks[i:])]
+
+
+def pr_diff_block(changes: list, max_tokens: int, mode: str = "auto") -> tuple:
+    """
+    The <diff> block of the PR context, which every call reads from the cache.
+    "full" holds every reviewable file's line-numbered diff, so each call sees the
+    whole PR. "compact" holds only each file's hunk headers, for PRs too large to
+    send with every call; each review task then carries its own file's diff.
+    "auto" picks full when it fits in max_tokens. Returns (block, is_compact).
+    """
+    full = "<diff>\n" + "".join(
+        f'<file path="{change.path}">\n{annotate_patch(change.patch)}\n</file>\n' for change in changes
+    ) + "</diff>"
+    if mode == "full" or (mode == "auto" and len(full) / CHARS_PER_TOKEN <= max_tokens):
+        return full, False
+    compact = "<diff>\n" + "".join(
+        f'<file path="{change.path}">\n'
+        + "\n".join(line for line in change.patch.split("\n") if _HUNK_HEADER.match(line))
+        + "\n</file>\n"
+        for change in changes
+    ) + "</diff>"
+    return compact, True
+
+
+def numbered_file(path: str, content: str | None, patch: str) -> str | None:
+    """
+    The <file> block for a review task: the file's current text with line numbers,
+    so the model can check what the diff alone doesn't show. Long files are shown
+    as windows around the changed hunks.
+    """
+    if not content:
+        return None
+    lines = content.split("\n")
+    if len(lines) <= MAX_FULL_FILE_LINES:
+        keep = range(1, len(lines) + 1)
+    else:
+        wanted = set()
+        for line in _lines(patch):
+            header = _HUNK_HEADER.match(line)
+            if header:
+                start = int(header.group(1))
+                length = int(header.group(2)) if header.group(2) is not None else 1
+                wanted.update(range(start - _FILE_WINDOW_LINES, start + length + _FILE_WINDOW_LINES))
+        keep = sorted(n for n in wanted if 1 <= n <= len(lines))
+    out, previous = [], 0
+    for n in keep:
+        if n != previous + 1:
+            out.append("   ...")
+        out.append(f"{n:>6}  {lines[n - 1]}")
+        previous = n
+    shown = "" if len(keep) == len(lines) else ' shown="windows around the changes"'
+    return f'<file path="{path}" lines="{len(lines)}"{shown}>\n' + "\n".join(out) + "\n</file>"
 
 
 def walkthrough_diff(changes: list) -> tuple:
