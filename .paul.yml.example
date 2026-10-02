@@ -1,6 +1,11 @@
 # Paul PR Review — Per-Repo Configuration
 # Copy this file to .paul.yml in the root of your repository and customise it.
 # All fields are optional — Paul uses sensible defaults for everything.
+#
+# Paul reads this file (and CLAUDE.md, README.md and .agents/rules/*.md) from the
+# PR's base branch, so a PR can't change the rules it is reviewed by. A change to
+# this file applies to reviews after it merges. To stop a PR from editing the
+# workflow that runs Paul, see "Hardening the gate" in Paul's README.
 
 # ── LLM Configuration ────────────────────────────────────────────────────────
 
@@ -8,46 +13,65 @@
 provider: anthropic
 
 # Model to use. Any LiteLLM-compatible model string for the selected provider.
-# Anthropic examples:  claude-sonnet-4-6 | claude-opus-4-6 | claude-haiku-4-5-20251001
-# OpenAI examples:     gpt-4o | gpt-4o-mini | o1-preview
-# Google examples:     gemini-1.5-pro | gemini-1.5-flash
+# Anthropic examples:  claude-sonnet-4-6 | claude-sonnet-5-5 | claude-opus-5-5
+# OpenAI examples:     gpt-4o | gpt-4o-mini
+# Google examples:     gemini-2.5-pro | gemini-2.5-flash
 model: claude-sonnet-4-6
 
-# Maximum tokens in the LLM response.
-max_tokens: 4096
+# Maximum tokens in each LLM response. Capped at what the model can produce.
+max_tokens: 16000
 
-# Temperature (0 = deterministic, best for code review).
-temperature: 0
+# Optional sampling temperature (0 = most deterministic). Leave unset to use the
+# model's default. It is never sent to models that reject it (Claude Opus 4.7+,
+# Sonnet 5 and newer).
+# temperature: 0
+
+# Language for the review text (summaries, findings, fixes). Leave empty for English.
+# language: Spanish
 
 # ── Review Behaviour ──────────────────────────────────────────────────────────
 
-# Minimum severity that blocks the PR and requests changes.
+# Minimum severity that fails the check.
 # Options: critical | major | minor
 # - "critical": only block for security/data-loss issues
 # - "major":    also block for functional bugs and missing tests (recommended)
 # - "minor":    block for any code quality issues
 severity_threshold: major
 
+# What to do when a file with changes couldn't be reviewed (the LLM stayed
+# unavailable, its response was cut off, or the diff was too large for the
+# GitHub API). The comment always lists those files.
+# - "fail":    fail the check (recommended when Paul is a required check)
+# - "neutral": pass the check with a warning
+on_incomplete: fail
+
+# What to do when a PR from a fork or Dependabot has no API key (they don't
+# receive repository secrets). A missing key on any other PR always fails the
+# check, since it usually means a misnamed secret.
+# - "skip": pass the check with a notice
+# - "fail": fail the check
+forks: skip
+
+# Paul stops after this many minutes and lists the files it didn't get to,
+# which then count as not reviewed. Keep it below the job's timeout-minutes.
+time_budget_minutes: 45
+
 # ── File Exclusions ───────────────────────────────────────────────────────────
 
-# Glob patterns for files to skip entirely. Lock files and generated assets
-# are excluded by default — list additional patterns here.
+# Patterns for files to skip entirely. They follow .gitignore rules: a pattern
+# without a slash ("*.lock") matches at any depth, a pattern with a leading or
+# middle slash ("docs/**") is anchored to the repo root, and "**/" matches any
+# number of directories.
+#
+# Your patterns are added to the built-in defaults: lockfiles (*.lock,
+# package-lock.json, npm-shrinkwrap.json, pnpm-lock.yaml, go.sum), dist/,
+# build/, __pycache__/, *.pyc, *.min.js and *.min.css.
 excluded_paths:
-  - "**/*.lock"
-  - "**/package-lock.json"
-  - "**/yarn.lock"
-  - "**/Pipfile.lock"
-  - "**/poetry.lock"
-  - "**/go.sum"
-  - "**/dist/**"
-  - "**/build/**"
-  - "**/__pycache__/**"
-  - "**/*.pyc"
-  - "**/*.min.js"
-  - "**/*.min.css"
-  # Add repo-specific exclusions below:
-  # - "migrations/**"
+  # - "**/migrations/**"
   # - "docs/**"
+
+# Set to false to drop the built-in defaults and use only the patterns above.
+exclude_defaults: true
 
 # ── Custom Instructions ───────────────────────────────────────────────────────
 

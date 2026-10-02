@@ -1,0 +1,12 @@
+# Direct dependencies. Edit this file, then regenerate the hash-locked
+# requirements.lock that action.yml installs:
+#
+#   uv pip compile requirements.in --universal --python-version 3.12 \
+#       --generate-hashes -o requirements.lock
+#
+# LiteLLM is pinned exactly: versions 1.82.7 and 1.82.8 shipped a credential
+# stealer, so upgrade deliberately, to a release that has been out for a while.
+litellm==1.102.1
+requests>=2.32,<3
+pyyaml>=6.0,<7
+pathspec>=0.12,<1

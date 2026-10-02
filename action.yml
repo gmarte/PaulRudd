@@ -1,5 +1,5 @@
 name: "Paul — AI PR Review"
-description: "Automated PR reviews powered by LLMs with severity-gated approvals. Paul Rudd = PR."
+description: "Automated PR reviews powered by LLMs with a severity-gated merge check. Paul Rudd = PR."
 author: "giancarlopro"
 
 branding:
@@ -8,27 +8,47 @@ branding:
 
 inputs:
   github_token:
-    description: "GitHub token with pull-requests:write, contents:read, statuses:write permissions."
-    required: true
+    description: "GITHUB_TOKEN or a GitHub App token with pull-requests:write and contents:read permissions. Defaults to the workflow's GITHUB_TOKEN."
+    required: false
+    default: ${{ github.token }}
   api_key:
     description: "API key for the configured LLM provider (Anthropic, OpenAI, or Google)."
     required: true
   config_path:
-    description: "Path to the per-repo config file relative to the repository root."
+    description: "Path to the per-repo config file relative to the repository root. Read from the PR's base branch."
     required: false
     default: ".paul.yml"
 
 runs:
   using: "composite"
   steps:
+    # update-environment: false keeps this Python off the PATH, so the rest of
+    # the caller's job keeps the Python it set up for itself.
     - name: Set up Python
-      uses: actions/setup-python@v5.4.0
+      id: python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
       with:
         python-version: "3.12"
+        update-environment: false
 
+    # Installs into a private venv from the hash-locked requirements: every
+    # package version is pinned and its hash checked, so a tampered release on
+    # PyPI fails the install instead of running next to the job's tokens.
     - name: Install dependencies
+      id: deps
       shell: bash
-      run: pip install -r ${{ github.action_path }}/requirements.txt
+      env:
+        PYTHON: ${{ steps.python.outputs.python-path }}
+        LOCK_FILE: ${{ github.action_path }}/requirements.lock
+      run: |
+        "$PYTHON" -m venv "$RUNNER_TEMP/paul-venv"
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          VENV_PYTHON="$RUNNER_TEMP/paul-venv/Scripts/python.exe"
+        else
+          VENV_PYTHON="$RUNNER_TEMP/paul-venv/bin/python"
+        fi
+        "$VENV_PYTHON" -m pip install --quiet --disable-pip-version-check --require-hashes -r "$LOCK_FILE"
+        echo "python=$VENV_PYTHON" >> "$GITHUB_OUTPUT"
 
     - name: Run Paul
       shell: bash
@@ -40,4 +60,12 @@ runs:
         PR_NUMBER: ${{ github.event.pull_request.number }}
         REPO: ${{ github.repository }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-      run: python ${{ github.action_path }}/src/paul.py
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PAUL_PYTHON: ${{ steps.deps.outputs.python }}
+        PAUL_SRC: ${{ github.action_path }}/src
+        PYTHONUTF8: "1"
+        # Stream the log as the review goes instead of all at once at the end.
+        PYTHONUNBUFFERED: "1"
+        # Use the model map bundled with the pinned LiteLLM instead of fetching one at startup.
+        LITELLM_LOCAL_MODEL_COST_MAP: "True"
+      run: '"$PAUL_PYTHON" "$PAUL_SRC/paul.py"'

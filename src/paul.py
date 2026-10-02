@@ -1,121 +1,344 @@
 """
 Paul — AI PR Review Bot entry point.
 
-Two-pass orchestration:
-  Pass 1 → Walkthrough (summary + changes) → post comment immediately
-  Pass 2 → Issues per file                 → edit comment with full review
+  Preflight → no API key: skip fork and Dependabot PRs with a notice, fail any other
+  Pass 1    → walkthrough (summary + changes) → summary comment posted immediately
+  Pass 2    → issues per file                 → summary comment updated with the review
+  Gate      → exit 1 on a finding at or above the threshold, or when a file with
+              changes couldn't be reviewed (unless on_incomplete is neutral)
+
+Every changed file lands in the coverage ledger: reviewed, skipped by design, or
+failed. A failed file is never counted as clean.
 """
 
+import os
+import re
 import sys
+import time
+import traceback
 
-import litellm
+import yaml
 
-from config import load_config
-from diff_processor import fetch_diff, split_into_file_blocks
-from github_client import (
-    edit_comment,
-    format_comment,
-    format_walkthrough,
-    post_walkthrough_comment,
-    submit_review,
-    get_previous_reviews,
-    format_previous_reviews,
+import github_client
+import render
+import reviewer
+from config import is_trusted_path, load_config
+from coverage import FAIL_LABELS, Coverage
+from diff_processor import (
+    PathFilter,
+    annotate_patch,
+    fetch_file_changes,
+    file_table,
+    new_line_range,
+    skip_reason,
+    split_in_two,
+    split_patch,
+    walkthrough_diff,
 )
-from reviewer import SEVERITY_ORDER, determines_outcome, review_file, review_walkthrough
+
+# Errors that will hit every remaining call too: stop reviewing the file's other parts.
+_RUN_WIDE_ERRORS = (reviewer.LLMUnavailable, reviewer.OutOfTime)
+_MAX_ANNOTATIONS = 10  # GitHub shows at most 10 error annotations per step
 
 
 def main() -> None:
+    # A console that can't encode a character (cp1252 on Windows, say) shouldn't crash the run.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
+
     print("Paul is on the case...")
 
-    config = load_config()
-    print(f"  Provider: {config['provider']} | Model: {config['model']}")
-    print(f"  Severity threshold: {config['severity_threshold']}")
+    if not os.environ.get("PR_NUMBER"):
+        event = os.environ.get("GITHUB_EVENT_NAME") or "unknown"
+        print(f"::error::Paul reviews pull requests, but this run has no PR (event: {event}). "
+              f"Run it on pull_request events.")
+        sys.exit(1)
 
-    # Fetch previous review comments
-    prev_comments = get_previous_reviews()
-    config["previous_reviews"] = format_previous_reviews(prev_comments)
+    try:
+        config = load_config()
+    except (ValueError, yaml.YAMLError) as e:
+        print(f"::error::Paul's configuration is invalid: {e}")
+        sys.exit(1)
+    print(f"  Provider: {config['provider']} | Model: {config['model']} | Config: {config['config_source']}")
+    print(f"  Severity threshold: {config['severity_threshold']} | On incomplete: {config['on_incomplete']}")
 
-
-    print("Fetching PR diff...")
-    diff = fetch_diff(config)
-    print(f"  Diff size: {len(diff):,} chars")
-
-    if not diff.strip():
-        print("Empty diff — nothing to review. Approving.")
-        submit_review("APPROVE", "No reviewable changes found (empty diff).")
+    pr = github_client.load_event().get("pull_request") or {}
+    if not reviewer.api_key_available(config):
+        _no_api_key(config, pr)
         return
 
-    # ── Pass 1: Walkthrough ──────────────────────────────────────────────────
-    print("Pass 1: Generating walkthrough...")
+    reviewer.set_deadline(time.monotonic() + config["time_budget_minutes"] * 60)
+    previous = github_client.find_summary_comment()
+    ctx = _run_context(config, pr, previous)
+
     try:
-        walkthrough = review_walkthrough(diff, config)
-    except (litellm.exceptions.InternalServerError, litellm.exceptions.ServiceUnavailableError):
-        print("API unavailable after all retries — skipping review.")
-        sys.exit(0)
-
-    print("  Posting walkthrough comment...")
-    comment_id = post_walkthrough_comment(format_walkthrough(walkthrough, config))
-    print(f"  Comment posted (id={comment_id}). Reviewers can see the walkthrough now.")
-
-    # ── Pass 2: Issues per file ──────────────────────────────────────────────
-    file_blocks = split_into_file_blocks(diff)
-    print(f"Pass 2: Reviewing {len(file_blocks)} file(s) for issues...")
-
-    all_issues = []
-    all_test_recs = []
-
-    for file_path, file_diff in file_blocks:
-        print(f"  → {file_path}")
+        outcome = _review(config, ctx)
+    except Exception as e:
+        # A bug or an unexpected API failure: say so on the PR instead of leaving
+        # the comment at "will update", and fail the check.
+        traceback.print_exc()
+        print(f"::error::Paul could not complete the review: {e}")
         try:
-            result = review_file(file_path, file_diff, config)
-        except (litellm.exceptions.InternalServerError, litellm.exceptions.ServiceUnavailableError):
-            print(f"    API unavailable for {file_path} — skipping file.")
-            continue
-        except ValueError as e:
-            print(f"    Skipping {file_path}: {e}")
-            continue
-        all_issues.extend(result.get("issues", []))
-        all_test_recs.extend(result.get("test_recommendations", []))
+            github_client.upsert_summary_comment(render.format_failure(str(e), ctx), ctx["comment_id"])
+        except Exception as post_error:
+            print(f"::warning::Could not post the failure notice ({post_error}).")
+        sys.exit(1)
 
-    # Recompute overall_severity from actual issues found (more accurate than Pass 1 estimate)
-    if all_issues:
-        max_issue = max(
-            all_issues,
-            key=lambda i: SEVERITY_ORDER.index(i.get("severity", "suggestion")),
-        )
-        overall_severity = max_issue.get("severity", "suggestion")
+    _exit(outcome, ctx)
+
+
+def _no_api_key(config: dict, pr: dict) -> None:
+    """
+    Fork and Dependabot PRs don't receive repository secrets, so a missing key is
+    expected there. Anywhere else it means a misnamed or deleted secret, which
+    must not turn the required check green.
+    """
+    head_repo = ((pr.get("head") or {}).get("repo") or {}).get("full_name")
+    base_repo = ((pr.get("base") or {}).get("repo") or {}).get("full_name") or os.environ.get("REPO")
+    author = (pr.get("user") or {}).get("login", "")
+    if pr and (head_repo is None or head_repo != base_repo):
+        reason = f"it comes from a fork ({head_repo or 'deleted repository'}), and forks don't receive repository secrets"
+    elif author == "dependabot[bot]":
+        reason = "Dependabot PRs don't receive repository secrets"
     else:
-        overall_severity = "suggestion"
+        print("::error::No LLM API key is available. Check that the action's api_key input points at an "
+              f"existing secret with the key for the '{config['provider']}' provider.")
+        sys.exit(1)
 
-    full_result = {
-        "overall_severity": overall_severity,
-        "summary": walkthrough["summary"],
-        "changes": walkthrough["changes"],
-        "issues": all_issues,
-        "test_recommendations": all_test_recs,
+    if config["forks"] == "fail":
+        print(f"::error::Paul can't review this PR: no LLM API key, because {reason}.")
+        sys.exit(1)
+    print(f"::notice::Paul skipped this PR: no LLM API key, because {reason}.")
+
+
+def _run_context(config: dict, pr: dict, previous: dict | None) -> dict:
+    repo = os.environ.get("REPO") or os.environ.get("GITHUB_REPOSITORY", "")
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    return {
+        "model": config["model"],
+        "threshold": config["severity_threshold"],
+        "config_source": config["config_source"],
+        "head_sha": os.environ.get("HEAD_SHA", ""),
+        "run_url": f"{server}/{repo}/actions/runs/{run_id}" if repo and run_id else "",
+        "pr_title": pr.get("title") or "",
+        "pr_body": pr.get("body") or "",
+        "pr_changed_files": pr.get("changed_files") or 0,
+        "prior_findings": render.decode_findings(previous["body"]) if previous else [],
+        "comment_id": previous["id"] if previous else None,
+        "coverage": Coverage(),
+        "notes": [],
+        "outcome": None,
+        "usage": reviewer.USAGE,
     }
 
-    issue_count = len(all_issues)
-    print(f"  Overall severity: {overall_severity} | Issues found: {issue_count}")
 
-    # ── Update comment with full review ──────────────────────────────────────
-    print("Updating comment with full review...")
-    edit_comment(comment_id, format_comment(full_result, config))
+def _review(config: dict, ctx: dict) -> str:
+    coverage = ctx["coverage"]
 
-    # ── Submit formal review ─────────────────────────────────────────────────
-    outcome = determines_outcome(overall_severity, config["severity_threshold"])
-    review_body = (
-        f"Paul found {issue_count} issue(s). Highest severity: {overall_severity}. "
-        f"See the review comment for details."
-    )
+    print("Fetching changed files...")
+    changes = fetch_file_changes()
+    if ctx["pr_changed_files"] > len(changes):
+        coverage.fail_unlisted(ctx["pr_changed_files"] - len(changes), "over_file_limit")
 
-    if outcome == "block":
-        print(f"Blocking PR (severity '{overall_severity}' meets threshold '{config['severity_threshold']}').")
-        submit_review("REQUEST_CHANGES", review_body)
-        sys.exit(1)  # Non-zero exit makes the workflow job fail → blocks the PR
+    path_filter = PathFilter.from_config(config)
+    reviewable = []
+    for change in changes:
+        reason = skip_reason(change, path_filter)
+        if reason is None:
+            reviewable.append(change)
+        elif reason in FAIL_LABELS:
+            coverage.fail(change.path, reason)
+        else:
+            coverage.skip(change.path, reason)
+    print(f"  {len(changes)} changed file(s): {len(reviewable)} to review, "
+          f"{len(coverage.skipped)} skipped, {coverage.failed_count} not reviewable")
+
+    touched = [c.path for c in changes if is_trusted_path(c.path, config["config_path"])]
+    if touched:
+        names = ", ".join(render.code_span(p) for p in touched)
+        ctx["notes"].append(
+            f"This PR changes {names}. Paul reads its configuration and guidelines from the base "
+            f"branch, so these changes apply to reviews after the PR merges."
+        )
+
+    result = {"summary": "", "changes": [], "issues": [], "test_recommendations": [], "resolved": []}
+
+    if reviewable:
+        pr_block = reviewer.pr_context(ctx["pr_title"], ctx["pr_body"], file_table(changes))
+
+        # ── Pass 1: Walkthrough ──────────────────────────────────────────────
+        print("Pass 1: Generating walkthrough...")
+        walkthrough = _walkthrough(reviewable, pr_block, config)
+        result.update(walkthrough)
+        ctx["comment_id"] = github_client.upsert_summary_comment(
+            render.format_walkthrough(walkthrough, ctx, len(reviewable)), ctx["comment_id"],
+            fallback_body=render.format_walkthrough({"summary": "", "changes": []}, ctx, len(reviewable)),
+        )
+        print(f"  Comment posted (id={ctx['comment_id']}). Reviewers can see the walkthrough now.")
+
+        # ── Pass 2: Issues per file ──────────────────────────────────────────
+        print(f"Pass 2: Reviewing {len(reviewable)} file(s) for issues...")
+        for change in reviewable:
+            left = reviewer.seconds_left()
+            if left is not None and left < 15:
+                print(f"  → {change.path}: not reviewed, time_budget_minutes ran out")
+                coverage.fail(change.path, "time_budget")
+                continue
+            print(f"  → {change.path}")
+            prior = [f for f in ctx["prior_findings"] if f["file"] == change.path]
+            reviews = _review_change(change, pr_block, prior, config, coverage)
+            issues = [issue for review in reviews for issue in review["issues"]]
+            result["issues"].extend(issues)
+            for review in reviews:
+                result["test_recommendations"].extend(review["test_recommendations"])
+            result["resolved"].extend(_resolved(prior, reviews, issues))
+    elif coverage.failed_count:
+        result["summary"] = "No file could be reviewed. See the list of files that were not reviewed."
     else:
-        print(f"Approving PR (severity '{overall_severity}' is below threshold '{config['severity_threshold']}').")
-        submit_review("APPROVE", review_body)
+        result["summary"] = "No reviewable changes: every changed file was skipped."
+
+    # Findings on files that couldn't be reviewed this time stay on record for the next run.
+    failed_paths = coverage.failed_paths
+    result["carried_findings"] = [f for f in ctx["prior_findings"] if f["file"] in failed_paths]
+
+    overall = reviewer.highest_severity(result["issues"])
+    result["overall_severity"] = overall
+    outcome = reviewer.determines_outcome(
+        overall, config["severity_threshold"], coverage.complete, config["on_incomplete"]
+    )
+    ctx["outcome"] = outcome
+    print(f"  Overall severity: {overall} | Issues found: {len(result['issues'])} | Outcome: {outcome}")
+    _log_findings(result["issues"], config["severity_threshold"])
+
+    # ── Publish ──────────────────────────────────────────────────────────────
+    print("Updating comment with full review...")
+    ctx["comment_id"] = github_client.upsert_summary_comment(
+        render.format_comment(result, ctx), ctx["comment_id"], fallback_body=render.format_minimal(result, ctx)
+    )
+    if reviewable:
+        github_client.submit_review(render.review_body(result, ctx))
+    if outcome in ("pass", "neutral"):
+        github_client.dismiss_stale_change_requests()
+    return outcome
+
+
+def _walkthrough(reviewable: list, pr_block: str, config: dict) -> dict:
+    diff_text, omitted = walkthrough_diff(reviewable)
+    if omitted:
+        print(f"  {len(omitted)} diff(s) left out of the walkthrough input to fit its budget.")
+    try:
+        return reviewer.review_walkthrough(reviewer.walkthrough_input(pr_block, diff_text, omitted), config)
+    except reviewer.ReviewError as e:
+        # The walkthrough is informational; the per-file review still runs.
+        print(f"::warning::Walkthrough unavailable ({e}); continuing with the per-file review.")
+        return {"summary": f"*Walkthrough unavailable: {FAIL_LABELS.get(e.reason, e.reason)}.*", "changes": []}
+
+
+def _review_change(change, pr_block: str, prior: list, config: dict, coverage: Coverage) -> list:
+    """
+    Review one file, in parts if it is large, and in halves if a part is too much
+    for one call. Every finished review is kept even when another part fails;
+    a failed part marks the whole file as not reviewed.
+    """
+    parts = split_patch(change.patch)
+    # (label, patch, may be split in two, is the whole file)
+    work = [
+        (change.path if len(parts) == 1 else f"{change.path} (part {i} of {len(parts)})", part, True, len(parts) == 1)
+        for i, part in enumerate(parts, 1)
+    ]
+    reviews, failure = [], None
+    while work:
+        label, patch, can_split, whole = work.pop(0)
+        # A partial view only hears about the earlier findings it can see, so it
+        # can't declare one resolved without looking at the code.
+        part_prior = prior if whole else _prior_in_range(prior, patch)
+        try:
+            content = reviewer.file_review_input(pr_block, label, annotate_patch(patch), part_prior)
+            reviews.append(reviewer.review_file(change.path, content, config))
+        except (reviewer.TruncatedOutput, reviewer.InputTooLarge) as e:
+            halves = split_in_two(patch) if can_split else [patch]
+            if len(halves) < 2:
+                failure = failure or e
+                print(f"    Not reviewed ({label}): {e}")
+                continue
+            print(f"    Too much for one call; reviewing {label} in two halves.")
+            work[:0] = [(f"{label} (half {i} of 2)", half, False, False) for i, half in enumerate(halves, 1)]
+        except reviewer.ReviewError as e:
+            failure = failure or e
+            print(f"    Not reviewed ({label}): {e}")
+            if isinstance(e, _RUN_WIDE_ERRORS):
+                break
+    if failure:
+        coverage.fail(change.path, failure.reason)
+    else:
+        coverage.review(change.path)
+    return reviews
+
+
+def _prior_in_range(prior: list, patch: str) -> list:
+    """The prior findings whose line falls inside this part of a split file."""
+    first, last = new_line_range(patch)
+    if first is None:
+        return []
+    return [f for f in prior if f["line_start"] and first <= f["line_start"] <= last]
+
+
+def _resolved(prior: list, reviews: list, issues: list) -> list:
+    """
+    The prior findings the model says this diff fixes, matched by exact title.
+    A finding reported again in this run is still open, whatever else the model said.
+    """
+    claimed = {t.strip().casefold() for review in reviews for t in review["resolved_prior_findings"]}
+    still_open = {issue["title"].strip().casefold() for issue in issues}
+    return [f for f in prior if f["title"].strip().casefold() in claimed - still_open]
+
+
+def _log_findings(issues: list, threshold: str) -> None:
+    """
+    Every finding goes to the run log, so nothing is lost when the comment has
+    to be shortened. Blocking findings also become error annotations.
+    """
+    if not issues:
+        return
+    print("Findings:")
+    blocking = reviewer.SEVERITY_ORDER.index(threshold)
+    annotations = 0
+    for issue in sorted(issues, key=lambda i: -reviewer.SEVERITY_ORDER.index(i["severity"])):
+        where = f"{issue['file']}:{issue['line_start']}" if issue["line_start"] else issue["file"]
+        print(f"  [{issue['severity']}] {_log_safe(where)}: {_log_safe(issue['title'])}")
+        if reviewer.SEVERITY_ORDER.index(issue["severity"]) >= blocking and annotations < _MAX_ANNOTATIONS:
+            annotations += 1
+            line = f",line={issue['line_start']}" if issue["line_start"] else ""
+            print(f"::error file={_command_property(issue['file'])}{line},title=Paul ({issue['severity']})::"
+                  f"{_command_data(issue['title'])}")
+
+
+def _log_safe(text: str) -> str:
+    """One log line that can't start or smuggle a workflow command."""
+    return re.sub(r"\s+", " ", str(text)).replace("::", ": :")
+
+
+def _command_data(text: str) -> str:
+    return _log_safe(text).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def _command_property(text: str) -> str:
+    return _command_data(text).replace(":", "%3A").replace(",", "%2C")
+
+
+def _exit(outcome: str, ctx: dict) -> None:
+    failed = ctx["coverage"].failed_count
+    if outcome == "block":
+        print(f"::error::Paul found issues at or above the '{ctx['threshold']}' threshold. See the review comment.")
+        sys.exit(1)  # Non-zero exit makes the workflow job fail → blocks the PR
+    if outcome == "fail":
+        print(f"::error::Paul could not review {failed} file(s), so the check fails (on_incomplete: fail). "
+              f"Re-run the job to retry.")
+        sys.exit(1)
+    if outcome == "neutral":
+        print(f"::warning::Paul could not review {failed} file(s); passing because on_incomplete is neutral.")
+    print("Paul found no blocking issues.")
 
 
 if __name__ == "__main__":
