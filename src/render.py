@@ -134,29 +134,53 @@ def code_span(text) -> str:
     return f"`{_code(text)}`"
 
 
-def encode_findings(issues: list) -> str:
-    """Findings as the hidden state block, most severe first, within _MAX_STATE_CHARS."""
+def encode_state(issues: list, file_hashes: dict) -> str:
+    """
+    The hidden state block: findings, most severe first, plus the diff fingerprint
+    of each file they are in (so the next run can tell whether that file changed),
+    within _MAX_STATE_CHARS.
+    """
     compact = [
         {"f": i["file"], "s": i["line_start"], "e": i["line_end"], "v": i["severity"], "t": i["title"][:200]}
         for i in _sorted(issues)
     ]
     while True:
-        payload = json.dumps(compact, ensure_ascii=False).encode("utf-8", errors="replace")
+        files = {item["f"]: file_hashes[item["f"]] for item in compact if item["f"] in file_hashes}
+        payload = json.dumps({"findings": compact, "files": files}, ensure_ascii=False).encode("utf-8", errors="replace")
         encoded = base64.b64encode(payload).decode("ascii")
         if len(encoded) <= _MAX_STATE_CHARS or not compact:
             return f"<!-- paul:findings {encoded} -->"
         compact = compact[: len(compact) * 3 // 4]
 
 
+def encode_findings(issues: list) -> str:
+    """The hidden state block for findings without file fingerprints."""
+    return encode_state(issues, {})
+
+
 def decode_findings(body: str) -> list:
     """The findings stored at the end of a previous summary comment ([] if none or unreadable)."""
+    return decode_state(body)[0]
+
+
+def decode_state(body: str) -> tuple:
+    """
+    (findings, {file: diff fingerprint}) from the end of a previous summary comment.
+    Comments from v2.0.0 stored a bare list of findings and no fingerprints.
+    """
     match = _FINDINGS_STATE.search(body or "")
     if not match:
-        return []
+        return [], {}
     try:
         raw = json.loads(base64.b64decode(match.group(1), validate=True).decode("utf-8"))
     except (ValueError, UnicodeDecodeError, binascii.Error):
-        return []
+        return [], {}
+    files = {}
+    if isinstance(raw, dict):
+        stored = raw.get("files")
+        if isinstance(stored, dict):
+            files = {k: v for k, v in stored.items() if isinstance(k, str) and isinstance(v, str)}
+        raw = raw.get("findings")
     findings = []
     for item in raw if isinstance(raw, list) else []:
         if not isinstance(item, dict) or not isinstance(item.get("f"), str):
@@ -169,7 +193,7 @@ def decode_findings(body: str) -> list:
             "severity": severity if isinstance(severity, str) and severity in SEVERITY_LABEL else "major",
             "title": str(item.get("t") or "")[:200],
         })
-    return findings
+    return findings, files
 
 
 # ── Sections ─────────────────────────────────────────────────────────────────
@@ -382,7 +406,7 @@ def _footer(ctx: dict, state_issues: list) -> list:
         "---",
         FOOTER.format(model=_code(ctx.get("model", "unknown model"))),
         SUMMARY_MARKER,
-        encode_findings(state_issues),
+        encode_state(state_issues, ctx.get("file_hashes", {})),
     ]
 
 

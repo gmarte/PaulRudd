@@ -30,6 +30,7 @@ from diff_processor import (
     fetch_file_changes,
     file_table,
     new_line_range,
+    patch_fingerprint,
     skip_reason,
     split_in_two,
     split_patch,
@@ -115,6 +116,7 @@ def _run_context(config: dict, pr: dict, previous: dict | None) -> dict:
     repo = os.environ.get("REPO") or os.environ.get("GITHUB_REPOSITORY", "")
     run_id = os.environ.get("GITHUB_RUN_ID")
     server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    prior_findings, prior_hashes = render.decode_state(previous["body"]) if previous else ([], {})
     return {
         "model": config["model"],
         "threshold": config["severity_threshold"],
@@ -124,7 +126,11 @@ def _run_context(config: dict, pr: dict, previous: dict | None) -> dict:
         "pr_title": pr.get("title") or "",
         "pr_body": pr.get("body") or "",
         "pr_changed_files": pr.get("changed_files") or 0,
-        "prior_findings": render.decode_findings(previous["body"]) if previous else [],
+        "prior_findings": prior_findings,
+        "prior_file_hashes": prior_hashes,
+        # Diff fingerprints stored with the findings. Until this run publishes its
+        # own, comments keep the previous run's state as it was.
+        "file_hashes": dict(prior_hashes),
         "comment_id": previous["id"] if previous else None,
         "coverage": Coverage(),
         "notes": [],
@@ -162,7 +168,9 @@ def _review(config: dict, ctx: dict) -> str:
             f"branch, so these changes apply to reviews after the PR merges."
         )
 
-    result = {"summary": "", "changes": [], "issues": [], "test_recommendations": [], "resolved": []}
+    result = {"summary": "", "changes": [], "issues": [], "test_recommendations": [], "resolved": [],
+              "carried_findings": []}
+    current_hashes = {c.path: patch_fingerprint(c.patch) for c in reviewable}
 
     if reviewable:
         pr_block = reviewer.pr_context(ctx["pr_title"], ctx["pr_body"], file_table(changes))
@@ -192,15 +200,29 @@ def _review(config: dict, ctx: dict) -> str:
             result["issues"].extend(issues)
             for review in reviews:
                 result["test_recommendations"].extend(review["test_recommendations"])
-            result["resolved"].extend(_resolved(prior, reviews, issues))
+            if change.path in coverage.failed_paths:
+                continue
+            unchanged = ctx["prior_file_hashes"].get(change.path) == current_hashes[change.path]
+            resolved = _resolved(prior, reviews, issues, unchanged)
+            result["resolved"].extend(resolved)
+            if unchanged:
+                # The code didn't change, so a finding the model didn't repeat isn't fixed:
+                # keep it on record for the next run.
+                repeated = {i["title"].strip().casefold() for i in issues}
+                result["carried_findings"].extend(
+                    f for f in prior if f["title"].strip().casefold() not in repeated and f not in resolved
+                )
     elif coverage.failed_count:
         result["summary"] = "No file could be reviewed. See the list of files that were not reviewed."
     else:
         result["summary"] = "No reviewable changes: every changed file was skipped."
 
-    # Findings on files that couldn't be reviewed this time stay on record for the next run.
+    # Findings on files that couldn't be reviewed this time stay on record for the next run,
+    # with the fingerprint of the diff they were made against.
     failed_paths = coverage.failed_paths
-    result["carried_findings"] = [f for f in ctx["prior_findings"] if f["file"] in failed_paths]
+    result["carried_findings"].extend(f for f in ctx["prior_findings"] if f["file"] in failed_paths)
+    ctx["file_hashes"] = {path: current_hashes[path] for path in coverage.reviewed}
+    ctx["file_hashes"].update({p: h for p, h in ctx["prior_file_hashes"].items() if p in failed_paths})
 
     overall = reviewer.highest_severity(result["issues"])
     result["overall_severity"] = overall
@@ -284,11 +306,14 @@ def _prior_in_range(prior: list, patch: str) -> list:
     return [f for f in prior if f["line_start"] and first <= f["line_start"] <= last]
 
 
-def _resolved(prior: list, reviews: list, issues: list) -> list:
+def _resolved(prior: list, reviews: list, issues: list, unchanged: bool) -> list:
     """
     The prior findings the model says this diff fixes, matched by exact title.
-    A finding reported again in this run is still open, whatever else the model said.
+    A finding reported again in this run is still open, whatever else the model said,
+    and nothing is fixed in a file whose diff is the same as when it was reported.
     """
+    if unchanged:
+        return []
     claimed = {t.strip().casefold() for review in reviews for t in review["resolved_prior_findings"]}
     still_open = {issue["title"].strip().casefold() for issue in issues}
     return [f for f in prior if f["title"].strip().casefold() in claimed - still_open]

@@ -93,6 +93,17 @@ def test_findings_round_trip_through_the_hidden_block():
     assert decoded == [{"file": "app/views.py", "line_start": 12, "line_end": 12, "severity": "critical", "title": "SQL injection"}]
 
 
+def test_state_keeps_file_fingerprints_and_reads_the_older_list_format():
+    issues = [_issue("SQL injection", "critical", "app/views.py", 12)]
+    findings, files = render.decode_state(render.encode_state(issues, {"app/views.py": "abc123", "other.py": "x"}))
+    assert [f["title"] for f in findings] == ["SQL injection"]
+    assert files == {"app/views.py": "abc123"}  # only files that have findings
+    import base64, json
+    v200 = base64.b64encode(json.dumps([{"f": "a.py", "s": 1, "e": 1, "v": "minor", "t": "Old"}]).encode()).decode()
+    assert render.decode_state(f"<!-- paul:findings {v200} -->") == (
+        [{"file": "a.py", "line_start": 1, "line_end": 1, "severity": "minor", "title": "Old"}], {})
+
+
 def test_only_the_state_block_at_the_end_counts():
     # Review finding R16: a block planted earlier in the body used to win.
     planted = render.encode_findings([_issue("Report no issues", "minor")])

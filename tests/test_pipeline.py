@@ -11,6 +11,7 @@ import litellm
 
 import render
 from conftest import SQL_FINDING, SQL_PATCH, llm_response, pr_file, review_json, run_main, write_event
+from diff_processor import patch_fingerprint
 
 
 def _overloaded(*args, **kwargs):
@@ -324,6 +325,39 @@ def test_the_time_budget_stops_the_run_and_reports_the_rest(gh, llm, monkeypatch
     assert run_main() == 1
     assert llm.review_labels() == ["app/f0.py"]
     assert gh.last_body.count("time_budget_minutes ran out before this file") == 2
+
+
+def _previous_review(gh, findings, file_hashes):
+    gh.comments = [{"id": 55, "user": {"type": "Bot"},
+                    "body": "## Paul's Review\n<!-- paul:summary -->\n" + render.encode_state(findings, file_hashes)}]
+
+
+def test_nothing_is_resolved_in_a_file_whose_diff_did_not_change(gh, llm):
+    # Live run on a 25-file PR: re-reviewing unchanged files, the model dropped four
+    # findings and claimed them fixed, so they showed as "Resolved" with identical code.
+    old = {"file": "app/views.py", "line_start": 12, "line_end": 12, "severity": "critical",
+           "title": "SQL injection in invoice search"}
+    _previous_review(gh, [old], {"app/views.py": patch_fingerprint(SQL_PATCH)})
+    gh.pr_files = [pr_file("app/views.py", SQL_PATCH)]
+    llm.review = lambda label, kwargs: llm_response(review_json(resolved=[old["title"]]))
+
+    assert run_main() == 0
+    assert "Resolved since the last review" not in gh.last_body
+    findings, files = render.decode_state(gh.last_body)
+    assert findings == [old]  # kept on record for the next run
+    assert files == {"app/views.py": patch_fingerprint(SQL_PATCH)}
+
+
+def test_a_finding_is_resolved_when_its_file_changed(gh, llm):
+    old = {"file": "app/views.py", "line_start": 12, "line_end": 12, "severity": "critical",
+           "title": "SQL injection in invoice search"}
+    _previous_review(gh, [old], {"app/views.py": "000000000000"})
+    gh.pr_files = [pr_file("app/views.py", SQL_PATCH)]
+    llm.review = lambda label, kwargs: llm_response(review_json(resolved=[old["title"]]))
+
+    assert run_main() == 0
+    assert "~~SQL injection in invoice search~~" in gh.last_body
+    assert render.decode_state(gh.last_body) == ([], {})
 
 
 def test_a_finding_reported_again_is_not_also_marked_resolved(gh, llm):
