@@ -12,6 +12,7 @@ import os
 os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")  # no model-map download at import
 
 import litellm  # noqa: E402
+import openai  # noqa: E402  (LiteLLM's exceptions derive from the OpenAI SDK's)
 
 import llm  # noqa: E402
 from schemas import ENVELOPE  # noqa: E402
@@ -67,8 +68,8 @@ def send(plan: llm.PromptPlan, config: dict, timeout: float) -> llm.Reply:
 
     try:
         response = litellm.completion(**kwargs)
-    except _FATAL:
-        raise
+    except _FATAL as e:
+        raise llm.Fatal(e) from e
     except litellm.exceptions.ContextWindowExceededError as e:
         raise llm.InputTooLarge(str(e)) from e
     except litellm.exceptions.ContentPolicyViolationError as e:
@@ -77,7 +78,7 @@ def send(plan: llm.PromptPlan, config: dict, timeout: float) -> llm.Reply:
         raise llm.ReviewError(f"request rejected: {e}") from e
     except _RETRYABLE as e:
         raise llm.Retry(e, _retry_after(e)) from e
-    except litellm.exceptions.APIError as e:
+    except openai.OpenAIError as e:  # 422s, response-validation errors and the rest of LiteLLM's tree
         raise llm.ReviewError(f"provider error: {e}") from e
 
     choice = response.choices[0]

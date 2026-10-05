@@ -62,21 +62,25 @@ runs:
 
     # Installs into a private venv from hash-locked requirements: every package
     # version is pinned and its hash checked, so a tampered release on PyPI fails
-    # the install instead of running next to the job's tokens.
+    # the install instead of running next to the job's tokens. The installs run
+    # isolated (-I) from the runner's temp directory: `python -m` would otherwise
+    # import a pip/ or venv/ package from the workspace, which holds the PR's code
+    # when the calling job checks it out.
     - name: Install Paul
       id: deps
       shell: bash
+      working-directory: ${{ runner.temp }}
       env:
         PYTHON: ${{ steps.python.outputs.python-path }}
         LOCK_FILE: ${{ github.action_path }}/requirements.lock
       run: |
-        "$PYTHON" -m venv "$RUNNER_TEMP/paul-venv"
+        "$PYTHON" -I -m venv "$RUNNER_TEMP/paul-venv"
         if [ "$RUNNER_OS" = "Windows" ]; then
           VENV_PYTHON="$RUNNER_TEMP/paul-venv/Scripts/python.exe"
         else
           VENV_PYTHON="$RUNNER_TEMP/paul-venv/bin/python"
         fi
-        "$VENV_PYTHON" -m pip install --quiet --disable-pip-version-check --require-hashes -r "$LOCK_FILE"
+        "$VENV_PYTHON" -I -m pip install --quiet --disable-pip-version-check --require-hashes -r "$LOCK_FILE"
         echo "python=$VENV_PYTHON" >> "$GITHUB_OUTPUT"
 
     # Claude goes through the Anthropic SDK; LiteLLM is installed only for OpenAI and Gemini.
@@ -96,10 +100,11 @@ runs:
     - name: Install LiteLLM
       if: steps.provider.outputs.provider != 'anthropic'
       shell: bash
+      working-directory: ${{ runner.temp }}
       env:
         PAUL_PYTHON: ${{ steps.deps.outputs.python }}
         LOCK_FILE: ${{ github.action_path }}/requirements-litellm.lock
-      run: '"$PAUL_PYTHON" -m pip install --quiet --disable-pip-version-check --require-hashes -r "$LOCK_FILE"'
+      run: '"$PAUL_PYTHON" -I -m pip install --quiet --disable-pip-version-check --require-hashes -r "$LOCK_FILE"'
 
     - name: Run Paul
       id: paul

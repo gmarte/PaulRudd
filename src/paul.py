@@ -6,7 +6,8 @@ Paul — AI PR Review Bot entry point.
               this first call also writes the shared prompt prefix to the cache
   Pass 2    → issues per file, `concurrency` files at a time, each reading the cache
   Gate      → exit 1 on a finding at or above the threshold, or when a file with
-              changes couldn't be reviewed (unless on_incomplete is neutral)
+              changes couldn't be reviewed (on_incomplete: neutral excuses only
+              files the LLM provider couldn't answer for)
 
 Every changed file lands in the coverage ledger: reviewed, skipped by design, or
 failed. A failed file is never counted as clean.
@@ -45,26 +46,45 @@ from diff_processor import (
 
 # Errors that will hit every remaining call too: stop reviewing the file's other parts.
 _RUN_WIDE_ERRORS = (llm.LLMUnavailable, llm.OutOfTime, llm.OverBudget)
-_MAX_ANNOTATIONS = 10  # GitHub shows at most 10 error annotations per step
+_MAX_ANNOTATIONS = 10        # GitHub shows at most 10 error annotations per step
+_HEAD_FILE_MIN_SECONDS = 60  # fetch a file's current text only with this much of the time budget left
+_HEAD_FILE_MAX_WAIT = 30     # longest GitHub rate-limit wait for it; the review goes on without it
+
+
+class _InternalError(llm.ReviewError):
+    """A bug, or an error no transport maps: the file fails, the others go on."""
+    reason = "internal_error"
 
 
 def main() -> None:
     # A console that can't encode a character (cp1252 on Windows, say) shouldn't crash the run.
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")
+    try:
+        _main()
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException:
+        # A failure before the review started (reading the PR's comments, say).
+        _set_outputs(verdict="error")
+        raise
 
+
+def _main() -> None:
     print("Paul is on the case...")
 
     if not os.environ.get("PR_NUMBER"):
         event = os.environ.get("GITHUB_EVENT_NAME") or "unknown"
-        print(f"::error::Paul reviews pull requests, but this run has no PR (event: {event}). "
+        print(f"::error::Paul reviews pull requests, but this run has no PR (event: {_command_data(event)}). "
               f"Run it on pull_request events.")
+        _set_outputs(verdict="error")
         sys.exit(1)
 
     try:
         config = load_config()
     except (ValueError, yaml.YAMLError) as e:
-        print(f"::error::Paul's configuration is invalid: {e}")
+        print(f"::error::Paul's configuration is invalid: {_command_data(str(e))}")
+        _set_outputs(verdict="error")
         sys.exit(1)
     print(f"  Provider: {config['provider']} | Model: {config['model']} | Effort: {config['effort'] or 'default'} "
           f"| Config: {config['config_source']}")
@@ -84,17 +104,19 @@ def main() -> None:
     try:
         outcome = _review(config, ctx)
     except Exception as e:
-        # A bug or an unexpected API failure: say so on the PR instead of leaving
-        # the comment at "will update", and fail the check.
-        traceback.print_exc()
-        print(f"::error::Paul could not complete the review: {e}")
+        # A bug, a fatal provider error (a bad key, say) or a GitHub failure: say so on
+        # the PR instead of leaving the comment at "will update", and fail the check.
+        _print_traceback()
+        print(f"::error::Paul could not complete the review: {_command_data(str(e))}")
         try:
-            github_client.upsert_summary_comment(render.format_failure(str(e), ctx), ctx["comment_id"])
+            ctx["comment_id"] = github_client.upsert_summary_comment(render.format_failure(str(e), ctx),
+                                                                     ctx["comment_id"])
         except Exception as post_error:
-            print(f"::warning::Could not post the failure notice ({post_error}).")
+            print(f"::warning::Could not post the failure notice ({_command_data(str(post_error))}).")
         _write_outputs(ctx, verdict="error")
         sys.exit(1)
 
+    _write_outputs(ctx, verdict=outcome)
     _exit(outcome, ctx)
 
 
@@ -114,12 +136,15 @@ def _no_api_key(config: dict, pr: dict) -> None:
     else:
         print("::error::No LLM API key is available. Check that the action's api_key input points at an "
               f"existing secret with the key for the '{config['provider']}' provider.")
+        _set_outputs(verdict="error")
         sys.exit(1)
 
     if config["forks"] == "fail":
-        print(f"::error::Paul can't review this PR: no LLM API key, because {reason}.")
+        print(f"::error::Paul can't review this PR: no LLM API key, because {_command_data(reason)}.")
+        _set_outputs(verdict="fail")
         sys.exit(1)
-    print(f"::notice::Paul skipped this PR: no LLM API key, because {reason}.")
+    print(f"::notice::Paul skipped this PR: no LLM API key, because {_command_data(reason)}.")
+    _set_outputs(verdict="skipped")
 
 
 def _run_context(config: dict, pr: dict, previous: dict | None) -> dict:
@@ -130,6 +155,7 @@ def _run_context(config: dict, pr: dict, previous: dict | None) -> dict:
     return {
         "model": config["model"],
         "threshold": config["severity_threshold"],
+        "on_incomplete": config["on_incomplete"],
         "config_source": config["config_source"],
         "head_sha": os.environ.get("HEAD_SHA", ""),
         "run_url": f"{server}/{repo}/actions/runs/{run_id}" if repo and run_id else "",
@@ -190,16 +216,27 @@ def _review(config: dict, ctx: dict) -> str:
     current_hashes = {c.path: patch_fingerprint(c.patch) for c in reviewable}
 
     if reviewable:
-        diff_block, compact = pr_diff_block(
-            reviewable, config["review"]["pr_context_max_tokens"], config["review"]["diff_context"])
+        review = config["review"]
+        diff_block, compact = pr_diff_block(reviewable, review["pr_context_max_tokens"], review["diff_context"])
         if compact:
             print("  The PR's diff is too large to send with every call; using compact PR context.")
-        plan = reviewer.build_plan(config, reviewer.pr_context(
-            ctx["pr_title"], ctx["pr_body"], file_table(changes), diff_block))
+        plan = _plan(config, ctx, changes, diff_block)
 
         # ── Pass 1: Walkthrough (also writes the shared prefix to the cache) ──
         print("Pass 1: Generating walkthrough...")
-        walkthrough = _walkthrough(reviewable, plan, config, compact)
+        walkthrough, error = _walkthrough(reviewable, plan, config, compact)
+        if isinstance(error, llm.InputTooLarge) and not compact:
+            # The size estimate was off (dense text such as CJK, base64 or minified code).
+            print("  The PR's diff doesn't fit the model's context window; using compact PR context.")
+            diff_block, compact = pr_diff_block(reviewable, review["pr_context_max_tokens"], "compact")
+            plan = _plan(config, ctx, changes, diff_block)
+            walkthrough, error = _walkthrough(reviewable, plan, config, compact)
+        if error:
+            # The walkthrough is informational; the per-file review still runs.
+            print(f"::warning::Walkthrough unavailable ({_command_data(str(error))}); "
+                  f"continuing with the per-file review.")
+            walkthrough = {"summary": f"*Walkthrough unavailable: {FAIL_LABELS.get(error.reason, error.reason)}.*",
+                           "changes": []}
         result.update(walkthrough)
         ctx["comment_id"] = github_client.upsert_summary_comment(
             render.format_walkthrough(walkthrough, ctx, len(reviewable)), ctx["comment_id"],
@@ -214,7 +251,12 @@ def _review(config: dict, ctx: dict) -> str:
                 pool.submit(_review_change, change, plan, ctx["prior_findings"], config, compact)
                 for change in reviewable
             ]
-            outcomes = [future.result() for future in futures]
+            try:
+                outcomes = [future.result() for future in futures]
+            except llm.Fatal:
+                for future in futures:
+                    future.cancel()  # the files not started yet would fail the same way
+                raise
 
         for change, (reviews, failure) in zip(reviewable, outcomes):
             if failure:
@@ -243,18 +285,15 @@ def _review(config: dict, ctx: dict) -> str:
     else:
         result["summary"] = "No reviewable changes: every changed file was skipped."
 
-    # Findings on files that couldn't be reviewed this time stay on record for the next run,
-    # with the fingerprint of the diff they were made against.
-    failed_paths = coverage.failed_paths
-    result["carried_findings"].extend(f for f in ctx["prior_findings"] if f["file"] in failed_paths)
-    ctx["file_hashes"] = {path: current_hashes[path] for path in coverage.reviewed}
-    ctx["file_hashes"].update({p: h for p, h in ctx["prior_file_hashes"].items() if p in failed_paths})
+    _record_failed_files(ctx, result, current_hashes)
 
     overall = reviewer.highest_severity(result["issues"])
     result["overall_severity"] = overall
-    outcome = reviewer.determines_outcome(
-        overall, config["severity_threshold"], coverage.complete, config["on_incomplete"]
-    )
+    # on_incomplete: neutral excuses only files the provider couldn't answer for; files
+    # left unreviewed for any other reason (size, budgets, refusals, unusable output)
+    # fail the check, since a PR's author could cause those on purpose.
+    on_incomplete = config["on_incomplete"] if coverage.excusable else "fail"
+    outcome = reviewer.determines_outcome(overall, config["severity_threshold"], coverage.complete, on_incomplete)
     ctx["outcome"] = outcome
     usage = llm.USAGE
     cost = f" | Cost: ~${usage['cost_usd']:.2f}" if usage["calls"] and usage["cost_known"] else ""
@@ -270,11 +309,39 @@ def _review(config: dict, ctx: dict) -> str:
         github_client.submit_review(render.review_body(result, ctx))
     if outcome in ("pass", "neutral"):
         github_client.dismiss_stale_change_requests()
-    _write_outputs(ctx, verdict=outcome)
     return outcome
 
 
-def _walkthrough(reviewable: list, plan: llm.PromptPlan, config: dict, compact: bool) -> dict:
+def _plan(config: dict, ctx: dict, changes: list, diff_block: str) -> llm.PromptPlan:
+    return reviewer.build_plan(config, reviewer.pr_context(ctx["pr_title"], ctx["pr_body"], file_table(changes),
+                                                           diff_block))
+
+
+def _record_failed_files(ctx: dict, result: dict, current_hashes: dict) -> None:
+    """
+    What the next run should know about the files that weren't fully reviewed: their
+    earlier findings stay on record (unless reported again), next to the fingerprint
+    of the diff the stored findings were made against.
+    """
+    failed_paths = ctx["coverage"].failed_paths
+    new_titles = {}
+    for issue in result["issues"]:
+        new_titles.setdefault(issue["file"], set()).add(issue["title"].strip().casefold())
+    result["carried_findings"].extend(
+        f for f in ctx["prior_findings"]
+        if f["file"] in failed_paths and f["title"].strip().casefold() not in new_titles.get(f["file"], set())
+    )
+    hashes = {path: current_hashes[path] for path in ctx["coverage"].reviewed}
+    for path in failed_paths:
+        if path in new_titles and path in current_hashes:
+            hashes[path] = current_hashes[path]  # a part of it was reviewed against this diff
+        elif path in ctx["prior_file_hashes"]:
+            hashes[path] = ctx["prior_file_hashes"][path]
+    ctx["file_hashes"] = hashes
+
+
+def _walkthrough(reviewable: list, plan: llm.PromptPlan, config: dict, compact: bool) -> tuple:
+    """Pass 1. Returns (walkthrough, None), or (None, the ReviewError) when it failed."""
     if compact:
         diff_text, omitted = walkthrough_diff(reviewable)
         if omitted:
@@ -283,21 +350,34 @@ def _walkthrough(reviewable: list, plan: llm.PromptPlan, config: dict, compact: 
     else:
         task = reviewer.walkthrough_task()
     try:
-        return reviewer.review_walkthrough(plan.with_task(task), config)
+        return reviewer.review_walkthrough(plan.with_task(task), config), None
     except llm.ReviewError as e:
-        # The walkthrough is informational; the per-file review still runs.
-        print(f"::warning::Walkthrough unavailable ({e}); continuing with the per-file review.")
-        return {"summary": f"*Walkthrough unavailable: {FAIL_LABELS.get(e.reason, e.reason)}.*", "changes": []}
+        return None, e
 
 
 def _review_change(change, plan: llm.PromptPlan, all_prior: list, config: dict, compact: bool) -> tuple:
     """
-    Review one file, in parts if it is large, and in halves if a part is too much
-    for one call. Runs on a worker thread. Every finished review is kept even when
-    another part fails. Returns (reviews, the first failure or None).
+    Review one file on a worker thread. Returns (reviews, the first failure or None).
+    A fatal error (a bad key, say) ends the run; any other unexpected error fails
+    this file only.
     """
-    llm.set_log_prefix(f"[{change.path}] ")
-    print(f"  → {change.path}")
+    llm.set_log_prefix(f"[{_log_safe(change.path)}] ")
+    print(f"  → {_log_safe(change.path)}")
+    try:
+        return _review_parts(change, plan, all_prior, config, compact)
+    except llm.Fatal:
+        raise
+    except Exception as e:
+        return [], _internal_error(e)
+
+
+def _review_parts(change, plan: llm.PromptPlan, all_prior: list, config: dict, compact: bool) -> tuple:
+    """
+    Review a file whole, or in parts if it is large. A call that is too large is
+    retried without the file's full text, then (when that makes it smaller) in
+    halves; a cut-off answer is retried in halves. Every finished review is kept
+    even when another part fails.
+    """
     left = llm.seconds_left()
     if left is not None and left < 15:
         return [], llm.OutOfTime("time_budget_minutes ran out")
@@ -305,44 +385,73 @@ def _review_change(change, plan: llm.PromptPlan, all_prior: list, config: dict, 
     prior = [f for f in all_prior if f["file"] == change.path]
     file_text = numbered_file(change.path, _head_file(change.path), change.patch)
     parts = split_patch(change.patch)
-    # (label, patch, may be split in two, is the whole file)
+    # (label, patch, may be split in two, is the whole file, send the file's text)
     work = [
-        (change.path if len(parts) == 1 else f"{change.path} (part {i} of {len(parts)})", part, True, len(parts) == 1)
+        (change.path if len(parts) == 1 else f"{change.path} (part {i} of {len(parts)})", part, True, len(parts) == 1,
+         True)
         for i, part in enumerate(parts, 1)
     ]
     reviews, failure = [], None
     while work:
-        label, patch, can_split, whole = work.pop(0)
+        label, patch, can_split, whole, with_file = work.pop(0)
         # A partial view only hears about the earlier findings it can see, so it
         # can't declare one resolved without looking at the code.
         part_prior = prior if whole else _prior_in_range(prior, patch)
         # The whole-file diff is already in the cached PR context, except in compact mode.
         shown_patch = annotate_patch(patch) if compact or not whole else None
         try:
-            task = reviewer.review_task(label, file_text, shown_patch, part_prior)
+            task = reviewer.review_task(label, file_text if with_file else None, shown_patch, part_prior)
             reviews.append(reviewer.review_file(change.path, plan.with_task(task), config))
-        except (llm.TruncatedOutput, llm.InputTooLarge) as e:
-            halves = split_in_two(patch) if can_split else [patch]
-            if len(halves) < 2:
-                failure = failure or e
-                llm.log(f"    Not reviewed ({label}): {e}")
+            continue
+        except llm.InputTooLarge as e:
+            if with_file and file_text:
+                llm.log(f"    Too large for one call; reviewing {_log_safe(label)} without the file's full text.")
+                work.insert(0, (label, patch, can_split, whole, False))
                 continue
-            llm.log(f"    Too much for one call; reviewing {label} in two halves.")
-            work[:0] = [(f"{label} (half {i} of 2)", half, False, False) for i, half in enumerate(halves, 1)]
+            # Halves help only when the task carries the diff; otherwise the shared context is what's too large.
+            halves = split_in_two(patch) if can_split and shown_patch is not None else [patch]
+            error, keep_file = e, False
+        except llm.TruncatedOutput as e:
+            halves = split_in_two(patch) if can_split else [patch]
+            error, keep_file = e, with_file
         except llm.ReviewError as e:
             failure = failure or e
-            llm.log(f"    Not reviewed ({label}): {e}")
+            llm.log(f"    Not reviewed ({_log_safe(label)}): {e}")
             if isinstance(e, _RUN_WIDE_ERRORS):
                 break
+            continue
+        except llm.Fatal:
+            raise
+        except Exception as e:
+            error = _internal_error(e)  # logged even when an earlier part already failed
+            failure = failure or error
+            continue
+        if len(halves) < 2:
+            failure = failure or error
+            llm.log(f"    Not reviewed ({_log_safe(label)}): {error}")
+            continue
+        llm.log(f"    Too much for one call; reviewing {_log_safe(label)} in two halves.")
+        work[:0] = [(f"{label} (half {i} of 2)", half, False, False, keep_file) for i, half in enumerate(halves, 1)]
     return reviews, failure
+
+
+def _internal_error(error: Exception) -> llm.ReviewError:
+    """Log an unexpected error with its traceback (call it from the except block) and wrap it."""
+    llm.log(f"    Not reviewed: unexpected {type(error).__name__}. Traceback:")
+    for line in traceback.format_exc().splitlines():
+        llm.log(f"    {_log_safe(line)}")
+    return _InternalError(f"{type(error).__name__}: {error}")
 
 
 def _head_file(path: str) -> str | None:
     """The file's text at the PR head (from the working directory outside a PR run), or None."""
     head_sha = os.environ.get("HEAD_SHA")
     if head_sha and os.environ.get("BASE_SHA"):
+        left = llm.seconds_left()
+        if left is not None and left < _HEAD_FILE_MIN_SECONDS:
+            return None
         try:
-            return github_client.get_file_at(path, head_sha)
+            return github_client.get_file_at(path, head_sha, max_wait=_HEAD_FILE_MAX_WAIT)
         except requests.RequestException as e:
             llm.log(f"    Couldn't fetch the file's current text ({e}); reviewing the diff alone.")
             return None
@@ -412,12 +521,31 @@ def _write_outputs(ctx: dict, verdict: str) -> None:
         "cache_hit_ratio": f"{hit_ratio:.3f}",
         "comment_url": comment_url,
     }
-    if os.environ.get("GITHUB_OUTPUT"):
-        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
-            f.writelines(f"{key}={value}\n" for key, value in outputs.items())
+    _set_outputs(**outputs)
     if os.environ.get("GITHUB_STEP_SUMMARY"):
-        with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
-            f.write(render.step_summary(ctx, outputs, hit_ratio))
+        try:
+            with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+                f.write(render.step_summary(ctx, outputs, hit_ratio))
+        except OSError as e:
+            print(f"::warning::Could not write the job summary ({_command_data(str(e))}).")
+
+
+def _set_outputs(**values) -> None:
+    """Append step outputs; a failure to write them never changes the verdict."""
+    path = os.environ.get("GITHUB_OUTPUT")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.writelines(f"{key}={value}\n" for key, value in values.items())
+    except OSError as e:
+        print(f"::warning::Could not write the step outputs ({_command_data(str(e))}).")
+
+
+def _print_traceback() -> None:
+    """The current exception's traceback, with nothing in it able to start a workflow command."""
+    for line in traceback.format_exc().splitlines():
+        print(line.replace("::", ": :"))
 
 
 def _log_safe(text: str) -> str:
@@ -439,8 +567,12 @@ def _exit(outcome: str, ctx: dict) -> None:
         print(f"::error::Paul found issues at or above the '{ctx['threshold']}' threshold. See the review comment.")
         sys.exit(1)  # Non-zero exit makes the workflow job fail → blocks the PR
     if outcome == "fail":
-        print(f"::error::Paul could not review {failed} file(s), so the check fails (on_incomplete: fail). "
-              f"Re-run the job to retry.")
+        if ctx["on_incomplete"] == "neutral":
+            print(f"::error::Paul could not review {failed} file(s), so the check fails: on_incomplete: neutral "
+                  f"only excuses files the LLM provider couldn't answer for. See the review comment for the reasons.")
+        else:
+            print(f"::error::Paul could not review {failed} file(s), so the check fails (on_incomplete: fail). "
+                  f"Re-run the job to retry.")
         sys.exit(1)
     if outcome == "neutral":
         print(f"::warning::Paul could not review {failed} file(s); passing because on_incomplete is neutral.")

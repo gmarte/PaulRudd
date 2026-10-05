@@ -218,10 +218,11 @@ def _validate(config: dict) -> None:
         raise ValueError("budget.max_cost_usd must be a positive number")
 
     temperature = config["temperature"]
+    highest = 1 if config["provider"] == "anthropic" else 2  # the Claude API accepts 0-1
     if temperature is not None and (
-        isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not 0 <= temperature <= 2
+        isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not 0 <= temperature <= highest
     ):
-        raise ValueError("temperature must be a number between 0 and 2")
+        raise ValueError(f"temperature must be a number between 0 and {highest} for the {config['provider']} provider")
 
     if not isinstance(config["excluded_paths"], list) or not all(isinstance(p, str) for p in config["excluded_paths"]):
         raise ValueError("excluded_paths must be a list of glob patterns")

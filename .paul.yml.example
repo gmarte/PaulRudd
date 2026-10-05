@@ -32,12 +32,14 @@ model: claude-sonnet-5-5
 effort: medium
 
 # Maximum tokens in each LLM response (max_output_tokens is accepted too).
-# Capped at what the model can produce.
+# Capped at what the model can produce. Models that think before answering
+# (Claude Sonnet 5 and Opus 5 or newer) count the thinking too, so Paul gives
+# them at least 16000.
 max_tokens: 16000
 
-# Optional sampling temperature (0 = most deterministic). Leave unset to use the
-# model's default. It is never sent to models that reject it (Claude Opus 4.7+,
-# Sonnet 5 and newer).
+# Optional sampling temperature (0 = most deterministic; Claude accepts 0-1).
+# Leave unset to use the model's default. It is never sent to models that
+# reject it (Claude Opus 4.7+, Sonnet 5 and newer).
 # temperature: 0
 
 # Language for the review text (summaries, findings, fixes). Leave empty for English.
@@ -59,7 +61,11 @@ severity_threshold: major
 # unavailable, its response was cut off, the diff was too large for the GitHub
 # API, or a time or cost budget ran out). The comment always lists those files.
 # - "fail":    fail the check (recommended when Paul is a required check)
-# - "neutral": pass the check with a warning
+# - "neutral": pass the check with a warning, but only when the files couldn't
+#              be reviewed because the LLM provider stayed unavailable. Files
+#              left unreviewed for any other reason (too large, over a budget,
+#              refused, unusable answers) still fail the check, since a PR's
+#              author could cause those on purpose.
 on_incomplete: fail
 
 # What to do when a PR from a fork or Dependabot has no API key (they don't
@@ -103,8 +109,9 @@ budget:
   # Files past this many aren't reviewed and are listed as not reviewed.
   max_files: 300
   # No new LLM call starts once the run's estimated cost reaches this many US
-  # dollars; files Paul didn't get to are listed as not reviewed. Applies when
-  # Paul knows the model's prices (the review details then show the cost).
+  # dollars; files Paul didn't get to are listed as not reviewed. Calls already
+  # running finish, so a run can end a few calls over. Applies when Paul knows
+  # the model's prices (the review details then show the cost).
   max_cost_usd: 5.0
 
 # ── File Exclusions ───────────────────────────────────────────────────────────

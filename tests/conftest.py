@@ -224,11 +224,10 @@ def env(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     write_event(monkeypatch, tmp_path)
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
-    llm_core.reset_usage()
+    llm_core.reset_run()
     llm_core.set_deadline(None)
     llm_core.set_log_prefix("")
-    llm_anthropic.capabilities.cache_clear()
-    llm_anthropic._client.cache_clear()
+    llm_anthropic.reset()
     yield
     llm_core.set_deadline(None)
     llm_core.set_log_prefix("")

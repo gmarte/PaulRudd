@@ -10,12 +10,14 @@ rewards:
   4. task         — what this one call should do (changes on every call)
 
 A transport (llm_anthropic, llm_litellm) turns the plan into a provider request.
-It raises Retry for errors worth retrying; this module retries them with backoff,
-within the run's time budget, and keeps the run's token and cost totals.
+It raises Retry for errors worth retrying, a ReviewError for a call that can't
+produce a review, and Fatal for errors every call would hit. This module retries
+with backoff, within the run's time budget, and keeps the run's token and cost totals.
 """
 
 import dataclasses
 import random
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -28,15 +30,21 @@ _MIN_SECONDS_FOR_A_CALL = 15
 # 1.25x the input price for the 5-minute TTL and 2x for the 1-hour TTL.
 _PRICES = {
     "claude-fable-5-1": (10.0, 50.0, 0.25),
+    "claude-mythos-5-1": (10.0, 50.0, 0.25),
+    "claude-fable-5": (10.0, 50.0, 1.00),
+    "claude-mythos-5": (10.0, 50.0, 1.00),
     "claude-opus-5-5": (4.0, 20.0, 0.20),
     "claude-opus-5": (5.0, 25.0, 0.50),
     "claude-opus-4-8": (5.0, 25.0, 0.50),
     "claude-opus-4-7": (5.0, 25.0, 0.50),
     "claude-opus-4-6": (5.0, 25.0, 0.50),
+    "claude-opus-4-5": (5.0, 25.0, 0.50),
+    "claude-opus-4": (15.0, 75.0, 1.50),      # Opus 4 and 4.1
     "claude-sonnet-5-5": (2.0, 10.0, 0.20),
     "claude-sonnet-5": (2.0, 10.0, 0.20),
     "claude-sonnet-4-6": (3.0, 15.0, 0.30),
     "claude-sonnet-4-5": (3.0, 15.0, 0.30),
+    "claude-sonnet-4": (3.0, 15.0, 0.30),
     "claude-haiku-4-5": (1.0, 5.0, 0.10),
 }
 
@@ -49,6 +57,11 @@ _usage_lock = threading.Lock()
 
 # time.monotonic() value after which no new LLM call or retry starts (None = no limit).
 _deadline = None
+
+# Set once a call has run out of retries: the provider is down, so later calls
+# fail at once instead of each waiting through the whole backoff.
+_unavailable = None
+_warned_unknown_price = False
 
 # Files are reviewed on worker threads; each tags its log lines with its file.
 _local = threading.local()
@@ -87,6 +100,14 @@ class OverBudget(ReviewError):
     reason = "budget"
 
 
+class Fatal(Exception):
+    """An error every call would hit (a bad key, an unknown model, a missing permission or billing): it ends the run."""
+
+    def __init__(self, error: Exception):
+        super().__init__(f"{type(error).__name__}: {error}")
+        self.error = error
+
+
 class Retry(Exception):
     """Raised by a transport for an error worth retrying, with the provider's retry-after hint."""
 
@@ -119,18 +140,21 @@ class Usage:
 @dataclass
 class Reply:
     text: str | None
-    stop_reason: str        # "end" | "max_tokens" | "refusal"
+    stop_reason: str        # "end" | "max_tokens" | "context_window" | "refusal"
     usage: Usage
 
 
 # ── Calls ────────────────────────────────────────────────────────────────────
 
 def complete(plan: PromptPlan, config: dict) -> str:
-    """One LLM call with retries. Returns the reply text or raises a ReviewError."""
+    """One LLM call with retries. Returns the reply text or raises a ReviewError (or Fatal)."""
+    global _unavailable
     transport = _transport(config)
     attempt = 0
     while True:
         attempt += 1
+        if _unavailable:
+            raise LLMUnavailable(f"{_unavailable}, earlier in this run")
         left = seconds_left()
         if left is not None and left < _MIN_SECONDS_FOR_A_CALL:
             raise OutOfTime("time budget reached")
@@ -142,7 +166,8 @@ def complete(plan: PromptPlan, config: dict) -> str:
             reply = transport.send(plan, config, timeout)
         except Retry as e:
             if attempt > len(_RETRY_DELAYS):
-                raise LLMUnavailable(f"{type(e.error).__name__} after {attempt} attempts") from e.error
+                _unavailable = f"{type(e.error).__name__} after {attempt} attempts"
+                raise LLMUnavailable(_unavailable) from e.error
             delay = min(e.retry_after, 120.0) if e.retry_after is not None else (
                 _RETRY_DELAYS[attempt - 1] * random.uniform(0.8, 1.2))
             left = seconds_left()
@@ -153,8 +178,12 @@ def complete(plan: PromptPlan, config: dict) -> str:
             continue
 
         record_usage(reply.usage)
+        if reply.usage.cost_usd is None:
+            _warn_unknown_price(config["model"])
         if reply.stop_reason == "max_tokens":
-            raise TruncatedOutput(f"response hit max_tokens ({config['max_tokens']})")
+            raise TruncatedOutput("response hit the max_tokens limit")
+        if reply.stop_reason == "context_window":
+            raise InputTooLarge("the model's context window filled up")
         if reply.stop_reason == "refusal" or not reply.text:
             raise Refused(f"no review content (stop reason: {reply.stop_reason})")
         return reply.text
@@ -177,7 +206,11 @@ def set_log_prefix(prefix: str) -> None:
 
 
 def log(message: str) -> None:
-    print(f"{getattr(_local, 'prefix', '')}{message.lstrip()}" if getattr(_local, "prefix", "") else message)
+    """One log line. Line breaks are flattened so that text from a provider or a file
+    path can't start a line of its own (where the runner would read a workflow command)."""
+    prefix = getattr(_local, "prefix", "")
+    line = f"{prefix}{message.lstrip()}" if prefix else message
+    print(re.sub(r"[\r\n]+", " ", line))
 
 
 # ── Time budget ──────────────────────────────────────────────────────────────
@@ -210,10 +243,22 @@ def record_usage(usage: Usage) -> None:
         f"{usage.cache_write:,} written to cache), {usage.output:,} out")
 
 
-def reset_usage() -> None:
+def reset_run() -> None:
+    """Clear the run's totals and run-wide state (for tests; a real run is one process)."""
+    global _unavailable, _warned_unknown_price
     with _usage_lock:
         USAGE.update({"calls": 0, "input_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0,
                       "output_tokens": 0, "cost_usd": 0.0, "cost_known": True})
+    _unavailable = None
+    _warned_unknown_price = False
+
+
+def _warn_unknown_price(model: str) -> None:
+    global _warned_unknown_price
+    if not _warned_unknown_price:
+        _warned_unknown_price = True
+        print(f"::warning::Paul doesn't know the prices of {model}, so it can't estimate this run's cost "
+              f"or enforce budget.max_cost_usd.")
 
 
 def anthropic_cost(model: str, usage: Usage, write_1h_tokens: int = 0) -> float | None:

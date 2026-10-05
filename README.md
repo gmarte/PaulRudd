@@ -152,7 +152,7 @@ Paul reads `.paul.yml` and the guideline files from the base branch, so a PR can
 
 The `severity_threshold` in `.paul.yml` controls where blocking starts. Default is `major` — meaning `critical` and `major` issues fail the check, while `minor` and `suggestion` let it through.
 
-A file with changes that couldn't be reviewed (the LLM stayed unavailable, its response was cut off, GitHub didn't return the diff, or a time or cost budget ran out) also fails the check, unless `on_incomplete: neutral`. The comment lists every such file with the reason.
+A file with changes that couldn't be reviewed (the LLM stayed unavailable, its response was cut off, GitHub didn't return the diff, or a time or cost budget ran out) also fails the check. The comment lists every such file with the reason. `on_incomplete: neutral` lets the check pass with a warning only when the LLM provider was unavailable: a PR's author could cause any of the other reasons on purpose, so those always fail.
 
 ---
 
@@ -187,7 +187,7 @@ provider: anthropic
 model: claude-sonnet-5-5
 effort: medium              # low | medium | high | xhigh | max; "" = the model's default
 max_tokens: 16000           # per response (alias: max_output_tokens); capped at the model's limit
-# temperature: 0            # optional; never sent to models that reject it
+# temperature: 0            # optional (0-1 for Claude); never sent to models that reject it
 # language: Spanish         # language of the review text; English if unset
 concurrency: 4              # files reviewed at once (1-16)
 
@@ -195,7 +195,7 @@ concurrency: 4              # files reviewed at once (1-16)
 severity_threshold: major   # critical | major | minor
 
 # When a file with changes couldn't be reviewed
-on_incomplete: fail         # fail | neutral
+on_incomplete: fail         # fail | neutral (neutral excuses only provider outages)
 
 # When a fork or Dependabot PR has no API key (a missing key elsewhere always fails)
 forks: skip                 # skip | fail
@@ -213,7 +213,7 @@ review:
 
 budget:
   max_files: 300            # files past this aren't reviewed, and are listed
-  max_cost_usd: 5.0         # no new LLM call once the run's estimated cost reaches this
+  max_cost_usd: 5.0         # no new LLM call once the run's estimated cost reaches this (running calls finish)
 
 # .gitignore-style patterns for files to skip, added to the built-in defaults
 excluded_paths:
@@ -264,7 +264,7 @@ Files that couldn't be reviewed appear in a warning block at the top. Hidden mar
 
 | Output | Value |
 |--------|-------|
-| `verdict` | `pass`, `block`, `fail` (files not reviewed), `neutral` (files not reviewed, passing) or `error` |
+| `verdict` | `pass`, `block`, `fail` (files not reviewed), `neutral` (files not reviewed, passing), `skipped` (fork or Dependabot PR without a key) or `error` |
 | `highest_severity` | `critical`, `major`, `minor` or `suggestion` |
 | `findings` | Number of findings |
 | `reviewed_files`, `skipped_files`, `failed_files` | File counts from the coverage ledger |

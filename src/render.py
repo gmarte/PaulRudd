@@ -115,8 +115,9 @@ def format_failure(reason: str, ctx: dict) -> str:
         "",
         "Re-run the job to try again.",
     ]
-    # Keep the previous findings so the next run still knows what was reported.
-    lines += _footer(ctx, ctx.get("prior_findings", []))
+    # Keep the previous findings, with the fingerprints they were made against, so the
+    # next run still knows what was reported.
+    lines += _footer(ctx, ctx.get("prior_findings", []), ctx.get("prior_file_hashes", {}))
     return "\n".join(lines)
 
 
@@ -279,6 +280,9 @@ def _verdict_text(ctx: dict) -> str:
     if outcome == "block":
         return f"🔴 Changes needed: findings at or above the `{threshold}` threshold."
     if outcome == "fail":
+        if ctx.get("on_incomplete") == "neutral":
+            return (f"⚠️ Incomplete: {failed:,} file(s) could not be reviewed, so this check fails: "
+                    f"`on_incomplete: neutral` only excuses files the LLM provider couldn't answer for.")
         return f"⚠️ Incomplete: {failed:,} file(s) could not be reviewed, so this check fails (`on_incomplete: fail`)."
     if outcome == "neutral":
         return f"⚠️ Incomplete: {failed:,} file(s) could not be reviewed; passing because `on_incomplete: neutral`."
@@ -429,13 +433,13 @@ def _details_section(ctx: dict) -> list:
     return lines + ["", "</details>"]
 
 
-def _footer(ctx: dict, state_issues: list) -> list:
+def _footer(ctx: dict, state_issues: list, file_hashes: dict | None = None) -> list:
     return [
         "",
         "---",
         FOOTER.format(model=_code(ctx.get("model", "unknown model"))),
         SUMMARY_MARKER,
-        encode_state(state_issues, ctx.get("file_hashes", {})),
+        encode_state(state_issues, ctx.get("file_hashes", {}) if file_hashes is None else file_hashes),
     ]
 
 

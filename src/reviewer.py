@@ -16,10 +16,12 @@ import functools
 import json
 import os
 import re
+import secrets
 import unicodedata
 from pathlib import Path
 
 import llm
+from diff_processor import neutralize, one_line
 from schemas import CATEGORIES, CONFIDENCES
 
 PROMPTS = Path(__file__).parent.parent / "prompts"
@@ -56,12 +58,15 @@ def build_plan(config: dict, pr_block: str) -> llm.PromptPlan:
 
 
 def pr_context(title: str, body: str, file_table: str, diff_block: str) -> str:
-    """The PR-wide part of every request: what the PR says it does, what it touches, and how."""
-    body = (body or "").strip() or "(none)"
+    """
+    The PR-wide part of every request: what the PR says it does, what it touches,
+    and how. The author's title and description can't forge Paul's tags.
+    """
+    body = neutralize((body or "").strip()) or "(none)"
     if len(body) > _MAX_PR_BODY_CHARS:
         body = body[:_MAX_PR_BODY_CHARS] + "\n[description truncated]"
     return (
-        f"<pr>\nTitle: {title or '(none)'}\nDescription:\n{body}\n</pr>\n\n"
+        f"<pr>\nTitle: {one_line(title or '') or '(none)'}\nDescription:\n{body}\n</pr>\n\n"
         f"<changed_files>\n{file_table}\n</changed_files>\n\n"
         f"{diff_block}"
     )
@@ -73,7 +78,7 @@ def walkthrough_task(diff_text: str | None = None, omitted: list = ()) -> str:
     if diff_text is not None:
         parts.append(f"<diff_to_review>\n{diff_text}</diff_to_review>")
     if omitted:
-        names = "\n".join(f"- {c.path} (+{c.additions} -{c.deletions})" for c in omitted)
+        names = "\n".join(f"- {one_line(c.path)} (+{c.additions} -{c.deletions})" for c in omitted)
         parts.append(f"Diffs left out to fit the size budget (describe them from their names only):\n{names}")
     return "\n\n".join(parts)
 
@@ -84,14 +89,14 @@ def review_task(label: str, file_text: str | None, patch: str | None, prior_find
     diff to review isn't already in <diff>: in compact mode, or for one part of
     an oversized file.
     """
-    parts = [_prompt("task_review.md").format(label=label)]
+    parts = [_prompt("task_review.md").format(label=one_line(label))]
     if prior_findings:
-        lines = "\n".join(f"- [{f['severity']}] {_line_ref(f)}: {f['title']}" for f in prior_findings)
+        lines = "\n".join(f"- [{f['severity']}] {_line_ref(f)}: {one_line(f['title'])}" for f in prior_findings)
         parts.append(f"<prior_findings>\nReported by Paul on an earlier commit of this PR:\n{lines}\n</prior_findings>")
     if file_text:
         parts.append(file_text)
     if patch is not None:
-        parts.append(f"<diff_to_review>\n{patch}\n</diff_to_review>")
+        parts.append(f"<diff_to_review>\n{neutralize(patch)}\n</diff_to_review>")
     return "\n\n".join(parts)
 
 
@@ -203,9 +208,15 @@ def set_api_key_env(config: dict) -> None:
 
 
 def _debug(message: str) -> None:
-    """Print only when the workflow runs with debug logging (RUNNER_DEBUG=1): raw model output can be long."""
+    """
+    Print only when the workflow runs with debug logging (RUNNER_DEBUG=1): raw model
+    output can be long. It is untrusted, so workflow commands are off while it prints.
+    """
     if os.environ.get("RUNNER_DEBUG") == "1":
+        token = secrets.token_hex(16)
+        print(f"::stop-commands::{token}")
         print(message)
+        print(f"::{token}::")
 
 
 # ── Parsing and normalization ────────────────────────────────────────────────

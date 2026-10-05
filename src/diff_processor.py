@@ -21,11 +21,37 @@ MAX_FILE_PATCH_CHARS = 60_000   # patches above this are reviewed in parts
 MAX_PART_CHARS = 40_000         # target size of each part of a split patch
 MAX_WALKTHROUGH_CHARS = 80_000  # diff budget for the Pass 1 walkthrough in compact mode
 MAX_FULL_FILE_LINES = 1500      # longer files are shown as windows around their hunks
+MAX_FILE_TEXT_CHARS = 100_000   # a file's text past this is shown as windows, and dropped if those don't fit
+MAX_LINE_CHARS = 500            # longer lines (minified code, embedded data) are clipped in the file text
 _FILE_WINDOW_LINES = 60         # lines of context on each side of a hunk in a windowed file
 CHARS_PER_TOKEN = 3.5           # a conservative estimate for code
 
 _HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 _STATUS_LETTER = {"added": "A", "removed": "D", "modified": "M", "renamed": "R", "copied": "C"}
+# The tags that structure Paul's prompts. Untrusted text (the PR's description, file
+# paths, diffs, file contents, earlier findings) can't open or close one.
+_PAUL_TAG = re.compile(r"<(?=/?(?:pr|changed_files|diff|file|diff_to_review|prior_findings)[\s>/])", re.I)
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def neutralize(text: str) -> str:
+    """Untrusted text with Paul's prompt tags defused (`<diff>` becomes `&lt;diff>`)."""
+    return _PAUL_TAG.sub("&lt;", text)
+
+
+def one_line(text: str) -> str:
+    """Untrusted text for a single line of a prompt: tags defused, line breaks and control characters escaped."""
+    return _escape_control(neutralize(text))
+
+
+def _attr(path: str) -> str:
+    """A path as an attribute value: it can't close the quotes or the tag."""
+    escaped = _escape_control(path)
+    return escaped.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _escape_control(text: str) -> str:
+    return _CONTROL.sub(lambda m: repr(m.group())[1:-1], text)
 
 
 @dataclass
@@ -101,8 +127,8 @@ def file_table(changes: list) -> str:
     rows = []
     for change in changes:
         letter = _STATUS_LETTER.get(change.status, "M")
-        moved = f" (from {change.previous_path})" if change.previous_path else ""
-        rows.append(f"{letter}  {change.path}{moved}  +{change.additions} -{change.deletions}")
+        moved = f" (from {one_line(change.previous_path)})" if change.previous_path else ""
+        rows.append(f"{letter}  {one_line(change.path)}{moved}  +{change.additions} -{change.deletions}")
     return "\n".join(rows)
 
 
@@ -201,13 +227,14 @@ def pr_diff_block(changes: list, max_tokens: int, mode: str = "auto") -> tuple:
     "auto" picks full when it fits in max_tokens. Returns (block, is_compact).
     """
     full = "<diff>\n" + "".join(
-        f'<file path="{change.path}">\n{annotate_patch(change.patch)}\n</file>\n' for change in changes
+        f'<file path="{_attr(change.path)}">\n{neutralize(annotate_patch(change.patch))}\n</file>\n'
+        for change in changes
     ) + "</diff>"
     if mode == "full" or (mode == "auto" and len(full) / CHARS_PER_TOKEN <= max_tokens):
         return full, False
     compact = "<diff>\n" + "".join(
-        f'<file path="{change.path}">\n'
-        + "\n".join(line for line in change.patch.split("\n") if _HUNK_HEADER.match(line))
+        f'<file path="{_attr(change.path)}">\n'
+        + "\n".join(neutralize(line) for line in change.patch.split("\n") if _HUNK_HEADER.match(line))
         + "\n</file>\n"
         for change in changes
     ) + "</diff>"
@@ -218,12 +245,13 @@ def numbered_file(path: str, content: str | None, patch: str) -> str | None:
     """
     The <file> block for a review task: the file's current text with line numbers,
     so the model can check what the diff alone doesn't show. Long files are shown
-    as windows around the changed hunks.
+    as windows around the changed hunks, long lines are clipped, and a file whose
+    text still doesn't fit in MAX_FILE_TEXT_CHARS is left out (None).
     """
     if not content:
         return None
     lines = content.split("\n")
-    if len(lines) <= MAX_FULL_FILE_LINES:
+    if len(lines) <= MAX_FULL_FILE_LINES and len(content) <= MAX_FILE_TEXT_CHARS:
         keep = range(1, len(lines) + 1)
     else:
         wanted = set()
@@ -238,10 +266,19 @@ def numbered_file(path: str, content: str | None, patch: str) -> str | None:
     for n in keep:
         if n != previous + 1:
             out.append("   ...")
-        out.append(f"{n:>6}  {lines[n - 1]}")
+        out.append(f"{n:>6}  {_clip(neutralize(lines[n - 1].rstrip(chr(13))))}")
         previous = n
+    text = "\n".join(out)
+    if not keep or len(text) > MAX_FILE_TEXT_CHARS:
+        return None
     shown = "" if len(keep) == len(lines) else ' shown="windows around the changes"'
-    return f'<file path="{path}" lines="{len(lines)}"{shown}>\n' + "\n".join(out) + "\n</file>"
+    return f'<file path="{_attr(path)}" lines="{len(lines)}"{shown}>\n' + text + "\n</file>"
+
+
+def _clip(line: str) -> str:
+    if len(line) <= MAX_LINE_CHARS:
+        return line
+    return f"{line[:MAX_LINE_CHARS]} … [{len(line) - MAX_LINE_CHARS:,} more characters]"
 
 
 def walkthrough_diff(changes: list) -> tuple:
@@ -252,7 +289,8 @@ def walkthrough_diff(changes: list) -> tuple:
     """
     blocks, omitted, used = [], [], 0
     for change in sorted(changes, key=_walkthrough_priority):
-        block = f"--- {change.path} ({change.status}, +{change.additions} -{change.deletions})\n{change.patch}\n"
+        block = (f"--- {one_line(change.path)} ({change.status}, +{change.additions} -{change.deletions})\n"
+                 f"{neutralize(change.patch)}\n")
         if used + len(block) > MAX_WALKTHROUGH_CHARS:
             omitted.append(change)
             continue
