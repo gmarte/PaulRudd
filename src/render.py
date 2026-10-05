@@ -16,6 +16,7 @@ import re
 
 from coverage import FAIL_LABELS, SKIP_LABELS
 from github_client import REVIEW_PREFIX, SUMMARY_MARKER
+from reviewer import blocks
 
 MAX_COMMENT_CHARS = 60_000   # GitHub rejects bodies over 65,536 characters
 _MAX_STATE_CHARS = 20_000    # budget for the hidden findings block
@@ -44,7 +45,7 @@ SEVERITY_LABEL = {
 _SEVERITY_RANK = {"critical": 0, "major": 1, "minor": 2, "suggestion": 3}
 
 # How much to show, most first: (findings with full details, findings in the fix prompt).
-# Each value is "all", "blocking" (at or above the threshold) or "none". Blocking
+# Each value is "all", "blocking" (findings that block the merge) or "none". Blocking
 # findings keep their explanation and their place in the fix prompt longest, since
 # they are the ones a reviewer must act on; the prompt outlasts even their details,
 # because it carries them in a form a coding agent can apply.
@@ -243,11 +244,11 @@ def _comment_lines(result: dict, ctx: dict, detailed: str, prompted: str, shown:
     lines += _walkthrough_section(result, open_=False, counts=_counts(issues))
     lines += ["", "---"]
     for issue in in_detail:
-        lines += _format_issue(issue)
+        lines += _format_issue(issue, ctx)
     if in_brief:
         if in_detail:
             lines += ["", "**Other findings**"]
-        lines += _compact_issues(in_brief)
+        lines += _compact_issues(in_brief, ctx)
     if len(shown) < len(issues):
         lines += ["", f"*…and {len(issues) - len(shown)} more finding(s) that didn't fit in this comment. "
                       f"Every finding is listed in the run logs.*"]
@@ -266,8 +267,23 @@ def _selected(issue: dict, which: str, ctx: dict) -> bool:
     if which == "all":
         return True
     if which == "blocking":
-        return _SEVERITY_RANK[issue["severity"]] <= _SEVERITY_RANK[ctx["threshold"]]
+        return _blocks(issue, ctx)
     return False
+
+
+def _blocks(issue: dict, ctx: dict) -> bool:
+    return blocks(issue, ctx["threshold"], ctx.get("min_confidence", "medium"))
+
+
+def _label(issue: dict, ctx: dict) -> str:
+    """'🟠 [Major]', with the confidence when it is low or kept a finding from blocking."""
+    sev, confidence = issue["severity"], issue.get("confidence") or "medium"
+    label = SEVERITY_LABEL[sev]
+    if _SEVERITY_RANK[sev] <= _SEVERITY_RANK[ctx["threshold"]] and not _blocks(issue, ctx):
+        label += f" · {confidence} confidence, not blocking"
+    elif confidence == "low":
+        label += " · low confidence"
+    return f"{SEVERITY_EMOJI[sev]} [{label}]"
 
 
 def _state_findings(result: dict) -> list:
@@ -288,6 +304,11 @@ def _verdict_text(ctx: dict) -> str:
         return f"⚠️ Incomplete: {failed:,} file(s) could not be reviewed, so this check fails (`on_incomplete: fail`)."
     if outcome == "neutral":
         return f"⚠️ Incomplete: {failed:,} file(s) could not be reviewed; passing because `on_incomplete: neutral`."
+    unsure = [i for i in (ctx.get("result") or {}).get("issues", [])
+              if _SEVERITY_RANK[i["severity"]] <= _SEVERITY_RANK[threshold] and not _blocks(i, ctx)]
+    if unsure:
+        return (f"✅ No blocking issues (threshold: `{threshold}`). {len(unsure):,} finding(s) at or above it are "
+                f"below `min_confidence_to_block: {ctx.get('min_confidence', 'medium')}`, so they don't block.")
     return f"✅ No blocking issues (threshold: `{threshold}`)."
 
 
@@ -358,9 +379,8 @@ def _walkthrough_section(walkthrough: dict, open_: bool, counts: dict | None = N
     return lines
 
 
-def _format_issue(issue: dict) -> list:
-    sev = issue["severity"]
-    summary_line = (f"{SEVERITY_EMOJI[sev]} [{SEVERITY_LABEL[sev]}] {_summary_html(issue['title'])} — "
+def _format_issue(issue: dict, ctx: dict) -> list:
+    summary_line = (f"{html.escape(_label(issue, ctx))} {_summary_html(issue['title'])} — "
                     f"<code>{html.escape(_location_text(issue))}</code>")
 
     # One paragraph per field, so markup in one field can't run into the next.
@@ -375,12 +395,10 @@ def _format_issue(issue: dict) -> list:
     return ["", "<details>", f"<summary>{summary_line}</summary>", ""] + body + ["</details>"]
 
 
-def _compact_issues(issues: list) -> list:
+def _compact_issues(issues: list, ctx: dict) -> list:
     lines = [""]
     for issue in issues:
-        sev = issue["severity"]
-        lines.append(f"- {SEVERITY_EMOJI[sev]} [{SEVERITY_LABEL[sev]}] {_escape(issue['title'])} — "
-                     f"{code_span(_location_text(issue))}")
+        lines.append(f"- {_label(issue, ctx)} {_escape(issue['title'])} — {code_span(_location_text(issue))}")
     return lines
 
 

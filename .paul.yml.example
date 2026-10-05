@@ -57,6 +57,13 @@ concurrency: 4
 # - "minor":    block for any code quality issues
 severity_threshold: major
 
+# How sure Paul must be of a finding at or above the threshold for it to block:
+# low | medium | high. Each finding has a severity (its impact if it is real)
+# and a confidence (high: the code shown proves it; medium: very likely, on
+# reasonable assumptions; low: it depends on code Paul can't see). Less certain
+# findings are still shown, marked "not blocking".
+min_confidence_to_block: medium
+
 # What to do when a file with changes couldn't be reviewed (the LLM stayed
 # unavailable, its response was cut off, the diff was too large for the GitHub
 # API, or a time or cost budget ran out). The comment always lists those files.

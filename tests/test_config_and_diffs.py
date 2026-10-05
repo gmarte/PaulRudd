@@ -90,6 +90,7 @@ def test_unknown_keys_warn_and_lists_are_accepted(gh, capsys):
     "forks: allow\n",
     "temperature: hot\n",
     "temperature: 1.5\n",               # the Claude API accepts 0-1
+    "min_confidence_to_block: certain\n",
     "max_tokens: 10\n",
     "time_budget_minutes: 0\n",
     "- just\n- a list\n",

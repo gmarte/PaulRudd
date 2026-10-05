@@ -152,6 +152,8 @@ Paul reads `.paul.yml` and the guideline files from the base branch, so a PR can
 
 The `severity_threshold` in `.paul.yml` controls where blocking starts. Default is `major` — meaning `critical` and `major` issues fail the check, while `minor` and `suggestion` let it through.
 
+Severity is a finding's impact if it is real; how sure Paul is goes in a separate confidence (`high`: the code shown proves it, `medium`: very likely, `low`: it depends on code Paul can't see). A finding blocks only when it is at or above the threshold **and** at least as confident as `min_confidence_to_block` (default `medium`). Less certain findings are still shown, marked "not blocking".
+
 A file with changes that couldn't be reviewed (the LLM stayed unavailable, its response was cut off, GitHub didn't return the diff, or a time or cost budget ran out) also fails the check. The comment lists every such file with the reason. `on_incomplete: neutral` lets the check pass with a warning only when the LLM provider was unavailable: a PR's author could cause any of the other reasons on purpose, so those always fail.
 
 ---
@@ -193,6 +195,7 @@ concurrency: 4              # files reviewed at once (1-16)
 
 # Minimum severity that fails the check
 severity_threshold: major   # critical | major | minor
+min_confidence_to_block: medium  # low | medium | high: less certain findings are shown, not blocking
 
 # When a file with changes couldn't be reviewed
 on_incomplete: fail         # fail | neutral (neutral excuses only provider outages)

@@ -27,6 +27,7 @@ from schemas import CATEGORIES, CONFIDENCES
 PROMPTS = Path(__file__).parent.parent / "prompts"
 
 SEVERITY_ORDER = ["suggestion", "minor", "major", "critical"]
+CONFIDENCE_ORDER = ["low", "medium", "high"]
 
 # Severity labels by the start of a word, after lower-casing and removing accents
 # and decoration ("🔴 Critical" → "critical"). This also covers translations such as
@@ -186,6 +187,22 @@ def highest_severity(issues: list) -> str:
     if not issues:
         return "suggestion"
     return max((issue["severity"] for issue in issues), key=SEVERITY_ORDER.index)
+
+
+def confident_enough(issue: dict, min_confidence: str) -> bool:
+    """Whether a finding is sure enough to block. A finding without a confidence counts as medium."""
+    return CONFIDENCE_ORDER.index(issue.get("confidence") or "medium") >= CONFIDENCE_ORDER.index(min_confidence)
+
+
+def blocks(issue: dict, threshold: str, min_confidence: str) -> bool:
+    """Whether a finding blocks the merge: at or above the severity threshold, and confident enough."""
+    return (SEVERITY_ORDER.index(issue["severity"]) >= SEVERITY_ORDER.index(threshold)
+            and confident_enough(issue, min_confidence))
+
+
+def gating_severity(issues: list, min_confidence: str) -> str:
+    """The highest severity among the findings confident enough to block."""
+    return highest_severity([issue for issue in issues if confident_enough(issue, min_confidence)])
 
 
 def api_key_available(config: dict) -> bool:

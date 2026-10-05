@@ -88,8 +88,9 @@ def _main() -> None:
         sys.exit(1)
     print(f"  Provider: {config['provider']} | Model: {config['model']} | Effort: {config['effort'] or 'default'} "
           f"| Config: {config['config_source']}")
-    print(f"  Severity threshold: {config['severity_threshold']} | On incomplete: {config['on_incomplete']} "
-          f"| Concurrency: {config['concurrency']}")
+    print(f"  Severity threshold: {config['severity_threshold']} "
+          f"| Min confidence to block: {config['min_confidence_to_block']} "
+          f"| On incomplete: {config['on_incomplete']} | Concurrency: {config['concurrency']}")
 
     pr = github_client.load_event().get("pull_request") or {}
     if not reviewer.api_key_available(config):
@@ -155,6 +156,7 @@ def _run_context(config: dict, pr: dict, previous: dict | None) -> dict:
     return {
         "model": config["model"],
         "threshold": config["severity_threshold"],
+        "min_confidence": config["min_confidence_to_block"],
         "on_incomplete": config["on_incomplete"],
         "config_source": config["config_source"],
         "head_sha": os.environ.get("HEAD_SHA", ""),
@@ -289,16 +291,18 @@ def _review(config: dict, ctx: dict) -> str:
 
     overall = reviewer.highest_severity(result["issues"])
     result["overall_severity"] = overall
+    # Findings less sure than min_confidence_to_block are shown but don't block.
+    gating = reviewer.gating_severity(result["issues"], config["min_confidence_to_block"])
     # on_incomplete: neutral excuses only files the provider couldn't answer for; files
     # left unreviewed for any other reason (size, budgets, refusals, unusable output)
     # fail the check, since a PR's author could cause those on purpose.
     on_incomplete = config["on_incomplete"] if coverage.excusable else "fail"
-    outcome = reviewer.determines_outcome(overall, config["severity_threshold"], coverage.complete, on_incomplete)
+    outcome = reviewer.determines_outcome(gating, config["severity_threshold"], coverage.complete, on_incomplete)
     ctx["outcome"] = outcome
     usage = llm.USAGE
     cost = f" | Cost: ~${usage['cost_usd']:.2f}" if usage["calls"] and usage["cost_known"] else ""
     print(f"  Overall severity: {overall} | Issues found: {len(result['issues'])} | Outcome: {outcome}{cost}")
-    _log_findings(result["issues"], config["severity_threshold"])
+    _log_findings(result["issues"], config["severity_threshold"], config["min_confidence_to_block"])
 
     # ── Publish ──────────────────────────────────────────────────────────────
     print("Updating comment with full review...")
@@ -482,7 +486,7 @@ def _resolved(prior: list, reviews: list, issues: list, unchanged: bool) -> list
     return [f for f in prior if f["title"].strip().casefold() in claimed - still_open]
 
 
-def _log_findings(issues: list, threshold: str) -> None:
+def _log_findings(issues: list, threshold: str, min_confidence: str) -> None:
     """
     Every finding goes to the run log, so nothing is lost when the comment has
     to be shortened. Blocking findings also become error annotations.
@@ -490,12 +494,11 @@ def _log_findings(issues: list, threshold: str) -> None:
     if not issues:
         return
     print("Findings:")
-    blocking = reviewer.SEVERITY_ORDER.index(threshold)
     annotations = 0
     for issue in sorted(issues, key=lambda i: -reviewer.SEVERITY_ORDER.index(i["severity"])):
         where = f"{issue['file']}:{issue['line_start']}" if issue["line_start"] else issue["file"]
         print(f"  [{issue['severity']}] {_log_safe(where)}: {_log_safe(issue['title'])}")
-        if reviewer.SEVERITY_ORDER.index(issue["severity"]) >= blocking and annotations < _MAX_ANNOTATIONS:
+        if reviewer.blocks(issue, threshold, min_confidence) and annotations < _MAX_ANNOTATIONS:
             annotations += 1
             line = f",line={issue['line_start']}" if issue["line_start"] else ""
             print(f"::error file={_command_property(issue['file'])}{line},title=Paul ({issue['severity']})::"

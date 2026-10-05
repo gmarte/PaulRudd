@@ -45,6 +45,7 @@ DEFAULTS = {
     "effort": "medium",             # low | medium | high | xhigh | max; one value per run
     "concurrency": 4,               # files reviewed at once
     "severity_threshold": "major",  # critical | major | minor
+    "min_confidence_to_block": "medium",  # low | medium | high: less confident findings are shown, not blocking
     "excluded_paths": [],
     "exclude_defaults": True,
     "custom_instructions": "",
@@ -69,6 +70,7 @@ _ALIASES = {"max_output_tokens": "max_tokens"}
 
 VALID_PROVIDERS = {"anthropic", "openai", "google"}
 VALID_SEVERITIES = {"critical", "major", "minor"}
+VALID_CONFIDENCES = {"low", "medium", "high"}
 VALID_ON_INCOMPLETE = {"fail", "neutral"}
 VALID_FORKS = {"skip", "fail"}
 VALID_EFFORTS = {"", "low", "medium", "high", "xhigh", "max"}
@@ -182,6 +184,7 @@ def _validate(config: dict) -> None:
     for key, valid in (
         ("provider", VALID_PROVIDERS),
         ("severity_threshold", VALID_SEVERITIES),
+        ("min_confidence_to_block", VALID_CONFIDENCES),
         ("on_incomplete", VALID_ON_INCOMPLETE),
         ("forks", VALID_FORKS),
     ):

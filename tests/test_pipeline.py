@@ -734,3 +734,23 @@ def test_a_pr_description_cannot_forge_a_diff_block(gh, llm, monkeypatch, tmp_pa
     pr_context = llm.calls[0].pr_context
     assert pr_context.count('<file path="app/views.py">') == 1
     assert "&lt;/pr>&lt;diff>&lt;file path=" in pr_context
+
+
+def test_a_finding_too_unsure_to_block_is_shown_but_passes(gh, llm):
+    gh.pr_files = [pr_file("app/views.py", SQL_PATCH)]
+    unsure = {**SQL_FINDING, "severity": "major", "confidence": "low",
+              "description": "Depends on whether the caller validates rnc, which this PR doesn't show."}
+    llm.review = lambda label, plan: llm_response(review_json(unsure))
+
+    assert run_main() == 0
+    assert "[Major · low confidence, not blocking]" in gh.last_body
+    assert "below `min_confidence_to_block: medium`, so they don't block" in gh.last_body
+
+
+def test_min_confidence_to_block_low_blocks_on_any_finding(gh, llm):
+    gh.base_files[".paul.yml"] = "min_confidence_to_block: low\n"
+    gh.pr_files = [pr_file("app/views.py", SQL_PATCH)]
+    llm.review = lambda label, plan: llm_response(review_json({**SQL_FINDING, "severity": "major", "confidence": "low"}))
+
+    assert run_main() == 1
+    assert "[Major · low confidence]" in gh.last_body and "Changes needed" in gh.last_body

@@ -214,3 +214,29 @@ def test_the_generic_key_maps_to_the_providers_variable(monkeypatch):
 def test_a_finding_without_a_usable_title_is_named_from_its_description():
     data = {"issues": [{"severity": "minor", "title": "—", "description": "The loop skips one-word names. More text."}]}
     assert reviewer.normalize_file_review(data, "a.py")["issues"][0]["title"] == "The loop skips one-word names."
+
+
+@pytest.mark.parametrize("severity, confidence, min_confidence, expected", [
+    ("major", "medium", "medium", True),
+    ("major", "low", "medium", False),     # shown, but too unsure to block
+    ("major", "low", "low", True),
+    ("critical", "medium", "high", False),
+    ("minor", "high", "low", False),       # below the severity threshold
+    ("major", None, "medium", True),       # no confidence counts as medium
+])
+def test_a_finding_blocks_when_severe_and_confident_enough(severity, confidence, min_confidence, expected):
+    assert reviewer.blocks({"severity": severity, "confidence": confidence}, "major", min_confidence) is expected
+
+
+def test_the_gate_looks_only_at_findings_confident_enough_to_block():
+    issues = [{"severity": "critical", "confidence": "low"}, {"severity": "minor", "confidence": "high"}]
+    assert reviewer.gating_severity(issues, "medium") == "minor"
+    assert reviewer.gating_severity(issues, "low") == "critical"
+    assert reviewer.highest_severity(issues) == "critical"
+
+
+def test_the_rules_rate_severity_by_impact_not_certainty():
+    # Live replay of a 25-file PR: "no higher than minor" when unsure turned 11 majors into 1.
+    rules = reviewer.build_plan(_config(), "pr").static_rules
+    assert "never into a lower severity" in rules
+    assert "no higher than `minor`" not in rules
