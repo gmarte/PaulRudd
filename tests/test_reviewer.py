@@ -1,20 +1,17 @@
-"""The LLM layer: request shape, retries, parsing, normalization, prompts and the gate."""
+"""Prompt layers, tasks, parsing, normalization and the gate."""
 
-import httpx
-import litellm
+import json
+
 import pytest
 
+import llm as llm_core
 import reviewer
 from conftest import llm_response, review_json
 
 CONFIG = {
-    "provider": "anthropic",
-    "model": "claude-sonnet-4-6",
-    "max_tokens": 16000,
-    "temperature": None,
-    "repo_context": "",
-    "custom_instructions": "",
-    "language": "",
+    "provider": "anthropic", "model": "claude-sonnet-5-5", "max_tokens": 16000, "temperature": None,
+    "effort": "medium", "repo_context": "", "custom_instructions": "", "language": "",
+    "cache": {"ttl": "5m"}, "budget": {"max_cost_usd": 5.0},
 }
 
 
@@ -22,132 +19,89 @@ def _config(**overrides):
     return {**CONFIG, **overrides}
 
 
-# ── Request shape ────────────────────────────────────────────────────────────
+# ── Prompt layers ────────────────────────────────────────────────────────────
 
-def test_system_prompt_is_a_system_message_cached_on_anthropic(llm):
-    # B5: the old top-level `system=` kwarg was dropped by Gemini and rejected by OpenAI.
-    reviewer.review_file("a.py", "Review only this file: a.py", _config())
-    messages = llm.calls[0]["messages"]
-    assert messages[0]["role"] == "system"
-    assert messages[0]["content"][0]["cache_control"] == {"type": "ephemeral"}
-    assert "Severity Model" in messages[0]["content"][0]["text"]
-    assert messages[1] == {"role": "user", "content": "Review only this file: a.py"}
-    assert "system" not in llm.calls[0]
+def test_the_plan_layers_rules_then_repo_then_pr():
+    plan = reviewer.build_plan(_config(repo_context="### CLAUDE.md\n\nUse services.", custom_instructions="Flag raw SQL."),
+                               "<pr>...</pr>")
+    assert plan.static_rules.startswith("You are Paul") and "## Precision Rules" in plan.static_rules
+    assert plan.repo_context.index("Use services.") < plan.repo_context.index("Flag raw SQL.")
+    assert plan.pr_context == "<pr>...</pr>" and plan.task == ""
 
 
-def test_other_providers_get_a_plain_system_message(llm):
-    # B19: the old default of 32,768 was more than gpt-4o can produce.
-    reviewer.review_file("a.py", "Review only this file: a.py", _config(provider="openai", model="gpt-4o", max_tokens=32768))
-    call = llm.calls[0]
-    assert call["model"] == "openai/gpt-4o"
-    assert isinstance(call["messages"][0]["content"], str)
-    assert call["max_tokens"] == 16384  # capped at gpt-4o's output limit
+def test_repo_context_is_empty_without_guidelines_or_instructions():
+    assert reviewer.build_plan(_config(), "pr").repo_context == ""
 
 
-@pytest.mark.parametrize("model, sent", [
-    ("claude-sonnet-4-6", True),    # accepts temperature; the old regex never sent it
-    ("claude-sonnet-5-5", False),   # rejects sampling parameters
-    ("claude-opus-5-5", False),
-    ("claude-opus-4-7", False),
-])
-def test_temperature_is_sent_only_to_models_that_accept_it(llm, model, sent):
-    # B6
-    reviewer.review_file("a.py", "Review only this file: a.py", _config(model=model, temperature=0))
-    assert ("temperature" in llm.calls[0]) is sent
+def test_placeholder_text_inside_guidelines_is_left_alone():
+    # B16: chained .replace() used to expand placeholders again inside the injected CLAUDE.md.
+    plan = reviewer.build_plan(_config(repo_context="The {CUSTOM_INSTRUCTIONS} placeholder lives here.",
+                                       custom_instructions="Flag raw SQL."), "pr")
+    assert plan.repo_context.count("Flag raw SQL.") == 1
+    assert "The {CUSTOM_INSTRUCTIONS} placeholder" in plan.repo_context
 
 
-def test_temperature_is_not_sent_unless_configured(llm):
-    reviewer.review_file("a.py", "Review only this file: a.py", _config())
-    assert "temperature" not in llm.calls[0]
+def test_language_is_a_setting_not_hard_coded_spanish():
+    assert "Spanish" not in reviewer.build_plan(_config(), "pr").static_rules
+    assert "in Spanish" in reviewer.build_plan(_config(language="Spanish"), "pr").repo_context
 
 
-def test_a_model_that_rejects_temperature_is_retried_without_it(monkeypatch):
-    calls = []
-
-    def completion(**kwargs):
-        calls.append(kwargs)
-        if "temperature" in kwargs:
-            raise litellm.exceptions.BadRequestError(
-                message="temperature is not supported for this model", model="x", llm_provider="anthropic"
-            )
-        return llm_response(review_json())
-
-    monkeypatch.setattr(reviewer.litellm, "completion", completion)
-    reviewer.review_file("a.py", "Review only this file: a.py", _config(model="claude-new-9", temperature=0))
-    assert ["temperature" in c for c in calls] == [True, False]
+def test_pr_context_carries_title_description_files_and_diff():
+    block = reviewer.pr_context("Add search", "x" * 5000, "M  a.py  +2 -0", "<diff>...</diff>")
+    assert block.startswith("<pr>\nTitle: Add search")
+    assert "[description truncated]" in block
+    assert "<changed_files>\nM  a.py  +2 -0\n</changed_files>" in block and block.endswith("<diff>...</diff>")
 
 
-def test_every_call_has_a_timeout(llm):
-    reviewer.review_file("a.py", "Review only this file: a.py", _config())
-    assert llm.calls[0]["timeout"] == reviewer.LLM_TIMEOUT_SECONDS
+def test_review_task_carries_label_prior_findings_file_and_patch():
+    prior = [{"file": "a.py", "line_start": 3, "line_end": 4, "severity": "major", "title": "Off by one"}]
+    task = reviewer.review_task("a.py (part 1 of 2)", '<file path="a.py" lines="9">...</file>', "  1 +x", prior)
+    assert task.startswith("TASK: review\n\nReview only this file: a.py (part 1 of 2)")
+    assert "- [major] lines 3-4: Off by one" in task
+    assert '<file path="a.py"' in task and task.endswith("<diff_to_review>\n  1 +x\n</diff_to_review>")
+    assert "<diff_to_review>" not in reviewer.review_task("a.py", None, None, [])
 
 
-@pytest.mark.parametrize("model, provider, expected", [
-    ("claude-sonnet-4-6", "anthropic", "anthropic/claude-sonnet-4-6"),
-    ("gemini-2.5-pro", "google", "gemini/gemini-2.5-pro"),
-    ("gemini/gemini-2.5-pro", "google", "gemini/gemini-2.5-pro"),  # B19: used to become gemini/gemini/...
-    ("google/gemini-2.5-pro", "google", "gemini/gemini-2.5-pro"),
-    ("openai/gpt-4o", "openai", "openai/gpt-4o"),
-])
-def test_model_strings_resolve_to_litellm_prefixes(model, provider, expected):
-    assert reviewer.resolve_model({"model": model, "provider": provider}) == expected
+def test_walkthrough_task_brings_diffs_only_in_compact_mode():
+    assert reviewer.walkthrough_task().startswith("TASK: walkthrough") and "<diff_to_review>" not in reviewer.walkthrough_task()
+
+    class Omitted:
+        path, additions, deletions = "big.py", 900, 0
+
+    task = reviewer.walkthrough_task("--- a.py\n+x\n", [Omitted()])
+    assert "<diff_to_review>\n--- a.py\n+x\n</diff_to_review>" in task and "- big.py (+900 -0)" in task
 
 
-# ── Retries ──────────────────────────────────────────────────────────────────
+# ── Calls through the envelope ───────────────────────────────────────────────
 
-def _rate_limited(retry_after):
-    response = httpx.Response(429, headers={"retry-after": retry_after}, request=httpx.Request("POST", "https://x"))
-    return litellm.exceptions.RateLimitError(message="slow down", llm_provider="anthropic", model="x", response=response)
-
-
-def test_rate_limits_are_retried_after_the_providers_delay(monkeypatch):
-    # B7: a 429 used to crash the run.
-    sleeps, attempts = [], []
-    monkeypatch.setattr(reviewer.time, "sleep", sleeps.append)
-
-    def completion(**kwargs):
-        attempts.append(1)
-        if len(attempts) == 1:
-            raise _rate_limited("7")
-        return llm_response(review_json())
-
-    monkeypatch.setattr(reviewer.litellm, "completion", completion)
-    reviewer.review_file("a.py", "Review only this file: a.py", _config())
-    assert sleeps == [7.0]
+def _plan():
+    return reviewer.build_plan(_config(), "pr").with_task("TASK: review\n\nReview only this file: a.py")
 
 
-@pytest.mark.parametrize("error", [
-    litellm.exceptions.InternalServerError(message="Overloaded", llm_provider="anthropic", model="x"),
-    litellm.exceptions.Timeout(message="timed out", model="x", llm_provider="anthropic"),
-    litellm.exceptions.APIConnectionError(message="reset", llm_provider="anthropic", model="x"),
-])
-def test_persistent_failures_raise_llm_unavailable_after_six_attempts(monkeypatch, error):
-    attempts = []
-
-    def completion(**kwargs):
-        attempts.append(1)
-        raise error
-
-    monkeypatch.setattr(reviewer.litellm, "completion", completion)
-    with pytest.raises(reviewer.LLMUnavailable):
-        reviewer.review_file("a.py", "Review only this file: a.py", _config())
-    assert len(attempts) == 6
+def test_the_envelope_section_for_the_task_is_used(llm):
+    envelope = {"task": "review", "walkthrough": None, "verification": None,
+                "review": {"issues": [], "test_recommendations": [], "resolved_prior_findings": []}}
+    llm.review = lambda label, plan: llm_response(json.dumps(envelope))
+    assert reviewer.review_file("a.py", _plan(), _config())["issues"] == []
 
 
-def test_truncated_and_refused_responses_raise(monkeypatch):
-    monkeypatch.setattr(reviewer.litellm, "completion", lambda **kw: llm_response('{"issues": [', finish_reason="length"))
-    with pytest.raises(reviewer.TruncatedOutput):
-        reviewer.review_file("a.py", "Review only this file: a.py", _config())
-
-    monkeypatch.setattr(reviewer.litellm, "completion", lambda **kw: llm_response(None, finish_reason="content_filter"))
-    with pytest.raises(reviewer.Refused):
-        reviewer.review_file("a.py", "Review only this file: a.py", _config())
+def test_models_without_structured_outputs_may_answer_with_the_section_alone(llm):
+    llm.review = lambda label, plan: llm_response(review_json())
+    assert reviewer.review_file("a.py", _plan(), _config())["issues"] == []
 
 
-def test_unusable_output_is_requested_once_more(monkeypatch):
+def test_an_envelope_without_the_tasks_section_is_unusable(llm):
+    envelope = {"task": "review", "walkthrough": {"summary": "s", "changes": []}, "review": None, "verification": None}
+    llm.review = lambda label, plan: llm_response(json.dumps(envelope))
+    with pytest.raises(llm_core.InvalidOutput):
+        reviewer.review_file("a.py", _plan(), _config())
+    assert len(llm.calls) == 2  # asked once more before giving up
+
+
+def test_unusable_output_is_requested_once_more(llm):
     replies = iter([llm_response("Sorry, no JSON here."), llm_response(review_json())])
-    monkeypatch.setattr(reviewer.litellm, "completion", lambda **kw: next(replies))
-    assert reviewer.review_file("a.py", "Review only this file: a.py", _config())["issues"] == []
+    llm.review = lambda label, plan: next(replies)
+    assert reviewer.review_file("a.py", _plan(), _config())["issues"] == []
 
 
 # ── Parsing and normalization ────────────────────────────────────────────────
@@ -169,7 +123,7 @@ def test_json_is_found_around_prose_and_fences(raw):
     'Template: {"issues": []}. Review: {"issues": [{"title": "Bug"}]}',  # ambiguous: two objects
 ])
 def test_missing_broken_or_ambiguous_json_is_invalid_output(raw):
-    with pytest.raises(reviewer.InvalidOutput):
+    with pytest.raises(llm_core.InvalidOutput):
         reviewer._extract_json(raw)
 
 
@@ -188,8 +142,41 @@ def test_severities_are_normalized_and_unknown_ones_fail_closed(value, expected)
 
 @pytest.mark.parametrize("issue", ["critical: SQL injection at line 12", {}, {"severity": "major"}])
 def test_issues_that_cannot_be_shown_ask_for_the_review_again(issue):
-    with pytest.raises(reviewer.InvalidOutput):
+    with pytest.raises(llm_core.InvalidOutput):
         reviewer.normalize_file_review({"issues": [issue]}, "a.py")
+
+
+def test_findings_are_normalized_with_evidence_and_fixes():
+    data = {
+        "issues": [
+            {"severity": "Major", "file": "elsewhere.py", "line_start": "12", "title": "Bug",
+             "evidence": "x = f(y)", "category": "security", "confidence": "high", "pre_existing": True,
+             "suggestion": {"explanation": "Guard it.", "replacement": "x = f(y) if y else None"}},
+            {"severity": "minor", "title": "Nit", "suggestion": "Rename it.", "line_start": True,
+             "category": "vibes", "confidence": "certain"},
+        ],
+        "test_recommendations": None,
+    }
+    first, second = reviewer.normalize_file_review(data, "a.py")["issues"]
+    assert first["file"] == "a.py"  # from the request, never the model
+    assert (first["severity"], first["line_start"], first["line_end"]) == ("major", 12, 12)
+    assert (first["category"], first["confidence"], first["pre_existing"]) == ("security", "high", True)
+    assert first["suggestion"] == {"explanation": "Guard it.",
+                                   "autofix": {"original": "x = f(y)", "replacement": "x = f(y) if y else None"}}
+    assert second["suggestion"] == {"explanation": "Rename it.", "autofix": None}
+    assert (second["line_start"], second["category"], second["confidence"]) == (None, "correctness", "medium")
+
+
+def test_a_review_without_issues_field_is_invalid():
+    with pytest.raises(llm_core.InvalidOutput):
+        reviewer.normalize_file_review({"findings": []}, "a.py")
+
+
+def test_walkthrough_does_not_require_overall_severity():
+    # B23: a missing overall_severity used to crash Pass 1.
+    assert reviewer._normalize_walkthrough({"summary": "Adds search.", "changes": None}) == {
+        "summary": "Adds search.", "changes": [],
+    }
 
 
 @pytest.mark.parametrize("value, expected", [("12", 12), (0, None), (-3, None), (float("inf"), None), (True, None)])
@@ -201,67 +188,7 @@ def test_lone_surrogates_are_dropped_from_model_text():
     assert reviewer._as_text("bad \ud83d text").encode("utf-8")
 
 
-def test_file_review_output_is_normalized():
-    data = {
-        "issues": [
-            {"severity": "Major", "file": "elsewhere.py", "line_start": "12", "title": "Bug", "suggestion": "Fix it."},
-            {"severity": "minor", "title": "Nit", "suggestion": None, "line_start": True},
-        ],
-        "test_recommendations": None,
-    }
-    result = reviewer.normalize_file_review(data, "a.py")
-    first, second = result["issues"]
-    assert first["file"] == "a.py"  # from the request, never the model
-    assert (first["severity"], first["line_start"], first["line_end"]) == ("major", 12, 12)
-    assert first["suggestion"] == {"explanation": "Fix it.", "autofix": None}
-    assert second["suggestion"] == {"explanation": "", "autofix": None} and second["line_start"] is None
-    assert result["test_recommendations"] == [] and result["resolved_prior_findings"] == []
-
-
-def test_a_review_without_issues_field_is_invalid():
-    with pytest.raises(reviewer.InvalidOutput):
-        reviewer.normalize_file_review({"findings": []}, "a.py")
-
-
-def test_walkthrough_does_not_require_overall_severity():
-    # B23: a missing overall_severity used to crash Pass 1.
-    assert reviewer._normalize_walkthrough({"summary": "Adds search.", "changes": None}) == {
-        "summary": "Adds search.", "changes": [],
-    }
-
-
-# ── Prompts ──────────────────────────────────────────────────────────────────
-
-def test_custom_instructions_appear_once_even_when_context_mentions_the_placeholder():
-    # B16: chained .replace() expanded placeholders again inside the injected CLAUDE.md.
-    config = _config(
-        repo_context="### CLAUDE.md\n\nThe {CUSTOM_INSTRUCTIONS} placeholder lives in the template.",
-        custom_instructions="Flag raw SQL.",
-    )
-    prompt = reviewer._build_prompt(reviewer.ISSUES_PROMPT_PATH, config)
-    assert prompt.count("Flag raw SQL.") == 1
-    assert "The {CUSTOM_INSTRUCTIONS} placeholder" in prompt
-
-
-def test_language_is_a_setting_not_hard_coded_spanish():
-    # B17
-    plain = reviewer._build_prompt(reviewer.ISSUES_PROMPT_PATH, _config())
-    spanish = reviewer._build_prompt(reviewer.ISSUES_PROMPT_PATH, _config(language="Spanish"))
-    assert "Atendido" not in plain and "Spanish" not in plain
-    assert "in Spanish" in spanish
-
-
-def test_file_review_input_carries_pr_context_and_prior_findings():
-    pr_block = reviewer.pr_context("Add search", "Search by RNC.", "M  a.py  +2 -0")
-    prior = [{"file": "a.py", "line_start": 3, "line_end": 4, "severity": "major", "title": "Off by one"}]
-    content = reviewer.file_review_input(pr_block, "a.py", "     1 +x", prior)
-    assert "<pr>\nTitle: Add search" in content
-    assert "<changed_files>\nM  a.py  +2 -0" in content
-    assert "- [major] lines 3-4: Off by one" in content
-    assert content.endswith("Review only this file: a.py\n\n<diff>\n     1 +x\n</diff>")
-
-
-# ── Gate ─────────────────────────────────────────────────────────────────────
+# ── Gate and keys ────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("severity, complete, on_incomplete, expected", [
     ("critical", True, "fail", "block"),
@@ -274,24 +201,8 @@ def test_the_gate(severity, complete, on_incomplete, expected):
     assert reviewer.determines_outcome(severity, "major", complete, on_incomplete) == expected
 
 
-def test_no_call_starts_once_the_time_budget_is_spent(llm):
-    reviewer.set_deadline(0.0)  # long past
-    with pytest.raises(reviewer.OutOfTime):
-        reviewer.review_file("a.py", "Review only this file: a.py", _config())
-    assert llm.calls == []
-
-
-def test_retries_stop_when_the_time_budget_would_run_out(monkeypatch):
-    def completion(**kwargs):
-        raise litellm.exceptions.InternalServerError(message="Overloaded", llm_provider="anthropic", model="x")
-
-    monkeypatch.setattr(reviewer.litellm, "completion", completion)
-    reviewer.set_deadline(reviewer.time.monotonic() + 30)  # room for a retry or two, not the whole backoff
-    with pytest.raises(reviewer.OutOfTime):
-        reviewer.review_file("a.py", "Review only this file: a.py", _config())
-
-
-def test_usage_is_recorded_including_cache_reads(monkeypatch):
-    monkeypatch.setattr(reviewer.litellm, "completion", lambda **kw: llm_response(review_json(), prompt_tokens=9000, cache_read=7500))
-    reviewer.review_file("a.py", "Review only this file: a.py", _config())
-    assert reviewer.USAGE["input_tokens"] == 9000 and reviewer.USAGE["cache_read_tokens"] == 7500
+def test_the_generic_key_maps_to_the_providers_variable(monkeypatch):
+    monkeypatch.setenv("PAUL_API_KEY", "sk-generic")
+    assert reviewer.api_key_available(_config(provider="openai"))
+    reviewer.set_api_key_env(_config(provider="openai"))
+    assert reviewer.os.environ["OPENAI_API_KEY"] == "sk-generic"

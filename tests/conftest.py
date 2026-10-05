@@ -1,15 +1,15 @@
 """
-Shared fixtures: an in-memory GitHub API, a scripted stand-in for
-litellm.completion, and a clean environment for every test.
+Shared fixtures: an in-memory GitHub API, a scripted stand-in for the Claude
+transport (llm_anthropic.send), and a clean environment for every test.
 """
 
 import json
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
-from types import SimpleNamespace
 from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
@@ -19,9 +19,8 @@ os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import github_client  # noqa: E402
-import llm  # noqa: E402
+import llm as llm_core  # noqa: E402  (`llm` is the fake's fixture name)
 import llm_anthropic  # noqa: E402
-import reviewer  # noqa: E402
 
 REPO = "acme/shop"
 PR = "7"
@@ -168,8 +167,8 @@ def llm_response(content, finish_reason="stop", prompt_tokens=1200, cache_read=0
     """A transport reply (finish_reason uses the old names: stop, length, content_filter)."""
     stop = {"length": "max_tokens", "content_filter": "refusal"}.get(finish_reason, "end")
     fresh = max(prompt_tokens - cache_read, 0)
-    return llm.Reply(content, stop, llm.Usage(fresh_input=fresh, cache_read=cache_read, output=completion_tokens,
-                                              cost_usd=0.001))
+    return llm_core.Reply(content, stop, llm_core.Usage(fresh_input=fresh, cache_read=cache_read, output=completion_tokens,
+                                                        cost_usd=0.001))
 
 
 def review_json(*issues, resolved=(), test_recommendations=()):
@@ -191,7 +190,7 @@ class FakeLLM:
         self.calls = []  # the PromptPlan of every call
         self.walkthrough = lambda plan: llm_response(json.dumps({"summary": "Adds invoice search.", "changes": []}))
         self.review = lambda label, plan: llm_response(review_json())
-        self._lock = __import__("threading").Lock()
+        self._lock = threading.Lock()
 
     def __call__(self, plan, config, timeout):
         with self._lock:
@@ -212,7 +211,8 @@ class FakeLLM:
 
 @pytest.fixture(autouse=True)
 def env(monkeypatch, tmp_path):
-    for key in _KEY_VARS + ("PAUL_CONFIG_PATH", "RUNNER_DEBUG", "GITHUB_API_URL", "GITHUB_RUN_ID", "GITHUB_EVENT_NAME"):
+    for key in _KEY_VARS + ("PAUL_CONFIG_PATH", "RUNNER_DEBUG", "GITHUB_API_URL", "GITHUB_RUN_ID", "GITHUB_EVENT_NAME",
+                            "GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY", "ANTHROPIC_BASE_URL"):
         monkeypatch.setenv(key, "")
         monkeypatch.delenv(key)
     monkeypatch.setenv("GITHUB_TOKEN", "ghs_test")
@@ -224,13 +224,14 @@ def env(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     write_event(monkeypatch, tmp_path)
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
-    llm.reset_usage()
-    llm.set_deadline(None)
-    llm.set_log_prefix("")
+    llm_core.reset_usage()
+    llm_core.set_deadline(None)
+    llm_core.set_log_prefix("")
     llm_anthropic.capabilities.cache_clear()
+    llm_anthropic._client.cache_clear()
     yield
-    llm.set_deadline(None)
-    llm.set_log_prefix("")
+    llm_core.set_deadline(None)
+    llm_core.set_log_prefix("")
 
 
 def write_event(monkeypatch, tmp_path, **pull_request):

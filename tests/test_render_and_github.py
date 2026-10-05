@@ -253,3 +253,22 @@ def test_other_http_errors_propagate(gh):
         assert e.response.status_code == 401
     else:
         raise AssertionError("expected an HTTPError")
+
+
+def test_the_job_summary_reports_verdict_files_cache_and_cost():
+    outputs = {"verdict": "block", "findings": "3", "highest_severity": "major", "reviewed_files": "5",
+               "skipped_files": "1", "failed_files": "0", "cost_usd": "0.4210", "cache_hit_ratio": "0.865",
+               "comment_url": "https://github.com/acme/shop/pull/7#issuecomment-1"}
+    report = render.step_summary(_ctx("block"), outputs, 0.865)
+    assert report.startswith("### Paul's review") and "**🔴 Changes needed**" in report
+    assert "| Findings | 3 (highest: major) |" in report and "| Prompt cache | 86% of input tokens" in report
+    assert "| Estimated cost | $0.42 |" in report and "[Review comment](https://github.com/acme/shop/pull/7#" in report
+
+
+def test_review_details_show_the_estimated_cost_when_known():
+    ctx = _ctx()
+    ctx["usage"] = {"calls": 3, "input_tokens": 1000, "cache_read_tokens": 800, "output_tokens": 50,
+                    "cost_usd": 0.0123, "cost_known": True}
+    assert "· 3 LLM call(s) · ≈ $0.01" in render.format_comment(_result([]), ctx)
+    ctx["usage"]["cost_known"] = False
+    assert "≈ $" not in render.format_comment(_result([]), ctx)

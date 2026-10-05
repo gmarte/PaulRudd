@@ -10,15 +10,29 @@
 # ── LLM Configuration ────────────────────────────────────────────────────────
 
 # LLM provider: anthropic | openai | google
+# Claude runs on the official Anthropic SDK. OpenAI and Gemini run through
+# LiteLLM, which the action installs only when one of them is configured.
 provider: anthropic
 
-# Model to use. Any LiteLLM-compatible model string for the selected provider.
-# Anthropic examples:  claude-sonnet-4-6 | claude-sonnet-5-5 | claude-opus-5-5
+# Model to use. One model answers every call in a run, so the calls share one
+# prompt cache.
+# Anthropic examples:  claude-sonnet-5-5 | claude-opus-5-5 | claude-sonnet-4-6
 # OpenAI examples:     gpt-4o | gpt-4o-mini
 # Google examples:     gemini-2.5-pro | gemini-2.5-flash
-model: claude-sonnet-4-6
+#
+# On models with structured outputs (Claude Sonnet 5.5 and Opus 5.5, for
+# example) every answer follows Paul's JSON schema. On others, such as
+# claude-sonnet-4-6, Paul reads the JSON tolerantly and asks once more when an
+# answer is unusable.
+model: claude-sonnet-5-5
 
-# Maximum tokens in each LLM response. Capped at what the model can produce.
+# How hard the model works on each answer: low | medium | high | xhigh | max.
+# Higher effort finds more and costs more. A level the model doesn't support
+# isn't sent; "" leaves it to the model.
+effort: medium
+
+# Maximum tokens in each LLM response (max_output_tokens is accepted too).
+# Capped at what the model can produce.
 max_tokens: 16000
 
 # Optional sampling temperature (0 = most deterministic). Leave unset to use the
@@ -28,6 +42,9 @@ max_tokens: 16000
 
 # Language for the review text (summaries, findings, fixes). Leave empty for English.
 # language: Spanish
+
+# Files reviewed at the same time (1-16). Lower it if your API key hits rate limits.
+concurrency: 4
 
 # ── Review Behaviour ──────────────────────────────────────────────────────────
 
@@ -39,8 +56,8 @@ max_tokens: 16000
 severity_threshold: major
 
 # What to do when a file with changes couldn't be reviewed (the LLM stayed
-# unavailable, its response was cut off, or the diff was too large for the
-# GitHub API). The comment always lists those files.
+# unavailable, its response was cut off, the diff was too large for the GitHub
+# API, or a time or cost budget ran out). The comment always lists those files.
 # - "fail":    fail the check (recommended when Paul is a required check)
 # - "neutral": pass the check with a warning
 on_incomplete: fail
@@ -55,6 +72,40 @@ forks: skip
 # Paul stops after this many minutes and lists the files it didn't get to,
 # which then count as not reviewed. Keep it below the job's timeout-minutes.
 time_budget_minutes: 45
+
+# ── Prompt Cache ─────────────────────────────────────────────────────────────
+
+# Every call in a run starts with the same prefix: Paul's rules, this repo's
+# guidelines and instructions, then the PR's description and diff. The first
+# call writes it to the prompt cache and every later call reads it at a tenth
+# of the input price.
+cache:
+  # How long Paul's rules and this repo's guidelines stay cached: 5m | 1h.
+  # A 1h write costs 2x the input price (5m: 1.25x), but the next review in
+  # this repo within the hour starts warm. The PR's own context always uses
+  # 5m, since it changes on every push. (Claude only.)
+  ttl: 5m
+
+# ── Review Context ───────────────────────────────────────────────────────────
+
+review:
+  # How much of the PR's diff every call sees: auto | full | compact
+  # - full:    every file's diff, so each file is reviewed knowing the whole PR
+  # - compact: only each file's hunk headers; each call brings its own file's diff
+  # - auto:    full when it fits in pr_context_max_tokens, compact otherwise
+  diff_context: auto
+  # Estimated token limit for the PR context in auto mode.
+  pr_context_max_tokens: 80000
+
+# ── Budgets ──────────────────────────────────────────────────────────────────
+
+budget:
+  # Files past this many aren't reviewed and are listed as not reviewed.
+  max_files: 300
+  # No new LLM call starts once the run's estimated cost reaches this many US
+  # dollars; files Paul didn't get to are listed as not reviewed. Applies when
+  # Paul knows the model's prices (the review details then show the cost).
+  max_cost_usd: 5.0
 
 # ── File Exclusions ───────────────────────────────────────────────────────────
 
@@ -75,7 +126,7 @@ exclude_defaults: true
 
 # ── Custom Instructions ───────────────────────────────────────────────────────
 
-# Freeform text appended to Paul's system prompt.
+# Freeform text added to Paul's instructions, after the guideline files.
 # Use this to describe your stack, architecture, and what Paul should focus on.
 # Leave empty to use only the default review criteria.
 custom_instructions: |

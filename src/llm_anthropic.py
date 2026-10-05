@@ -60,9 +60,9 @@ def send(plan: llm.PromptPlan, config: dict, timeout: float) -> llm.Reply:
     try:
         message = _create(request, timeout)
     except anthropic.BadRequestError as e:
-        if "temperature" in request and "temperature" in str(e).lower():
+        if _has_temperature(request) and "temperature" in str(e).lower():
             llm.log("    The model rejected temperature; retrying without it.")
-            request.pop("temperature")
+            request.pop("extra_body")
             message = _create(request, timeout)
         else:
             raise
@@ -100,7 +100,9 @@ def build_request(plan: llm.PromptPlan, config: dict) -> dict:
         request["output_config"] = output_config
 
     if config.get("temperature") is not None and not _NO_SAMPLING_MODELS.search(model):
-        request["temperature"] = config["temperature"]
+        # SDK 1.x dropped sampling parameters from its signatures (newer models reject
+        # them); models that still accept them get the value in the raw request body.
+        request["extra_body"] = {"temperature": config["temperature"]}
     if _FALLBACK_MODELS.match(model):
         # A declined request is re-run server-side on the model Anthropic recommends
         # for that refusal category, instead of coming back as a refusal.
@@ -124,6 +126,8 @@ def capabilities(model: str) -> dict:
             "max_output": None,
         }
     caps = info.capabilities or {}
+    if not isinstance(caps, dict):  # the SDK returns a typed ModelCapabilities object
+        caps = caps.to_dict()
     effort = caps.get("effort") or {}
     return {
         "structured_outputs": bool((caps.get("structured_outputs") or {}).get("supported")),
@@ -150,7 +154,7 @@ def _create(request: dict, timeout: float):
     except anthropic.BadRequestError as e:
         if _TOO_LONG.search(str(e)):
             raise llm.InputTooLarge(str(e)) from e
-        if "temperature" in request and "temperature" in str(e).lower():
+        if _has_temperature(request) and "temperature" in str(e).lower():
             raise  # send() retries once without temperature
         raise llm.ReviewError(f"request rejected: {e}") from e
     except _RETRYABLE as e:
@@ -175,6 +179,10 @@ def _reply(message, requested_model: str) -> llm.Reply:
     # A request served by a refusal fallback is billed at the fallback model's prices.
     usage.cost_usd = llm.anthropic_cost(getattr(message, "model", None) or requested_model, usage, write_1h)
     return llm.Reply(text, stop, usage)
+
+
+def _has_temperature(request: dict) -> bool:
+    return "temperature" in request.get("extra_body", {})
 
 
 def _retry_after(error) -> float | None:

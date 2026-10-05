@@ -22,9 +22,23 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install Paul
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements.lock
+
+      # The action installs LiteLLM only for OpenAI and Gemini, so nothing on the
+      # Claude path may import it.
+      - name: Check that the Claude path runs without LiteLLM
         run: |
-          python -m pip install --disable-pip-version-check --require-hashes -r requirements.lock
+          python - <<'EOF'
+          import sys
+          sys.path.insert(0, "src")
+          import paul, llm_anthropic  # noqa: F401
+          assert "litellm" not in sys.modules, "the Claude path imports LiteLLM"
+          EOF
+
+      - name: Install LiteLLM and the test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes -r requirements-litellm.lock
           python -m pip install --disable-pip-version-check -r requirements-dev.txt
 
       - name: Run tests
