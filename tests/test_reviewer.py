@@ -140,7 +140,10 @@ def test_severities_are_normalized_and_unknown_ones_fail_closed(value, expected)
     assert reviewer.normalize_severity(value) == expected
 
 
-@pytest.mark.parametrize("issue", ["critical: SQL injection at line 12", {}, {"severity": "major"}])
+@pytest.mark.parametrize("issue", [
+    "critical: SQL injection at line 12", {}, {"severity": "major"},
+    {"severity": "minor", "title": ", ", "description": " "},   # seen in a live Sonnet 5.5 run
+])
 def test_issues_that_cannot_be_shown_ask_for_the_review_again(issue):
     with pytest.raises(llm_core.InvalidOutput):
         reviewer.normalize_file_review({"issues": [issue]}, "a.py")
@@ -206,3 +209,8 @@ def test_the_generic_key_maps_to_the_providers_variable(monkeypatch):
     assert reviewer.api_key_available(_config(provider="openai"))
     reviewer.set_api_key_env(_config(provider="openai"))
     assert reviewer.os.environ["OPENAI_API_KEY"] == "sk-generic"
+
+
+def test_a_finding_without_a_usable_title_is_named_from_its_description():
+    data = {"issues": [{"severity": "minor", "title": "—", "description": "The loop skips one-word names. More text."}]}
+    assert reviewer.normalize_file_review(data, "a.py")["issues"][0]["title"] == "The loop skips one-word names."

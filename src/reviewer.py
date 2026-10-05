@@ -276,10 +276,12 @@ def normalize_file_review(data: dict, file_path: str) -> dict:
     issues = []
     for item in raw_issues:
         # A finding written as a bare string, or an object with neither title nor
-        # description, can't be shown or gated reliably: ask for the review again.
+        # description (", " counts as neither), can't be shown or gated reliably:
+        # ask for the review again.
         if not isinstance(item, dict):
             raise llm.InvalidOutput("an issue is not a JSON object")
-        if not item.get("title") and not item.get("description"):
+        title, description = _as_text(item.get("title")).strip(), _as_text(item.get("description")).strip()
+        if not _has_words(title) and not _has_words(description):
             raise llm.InvalidOutput("an issue has neither a title nor a description")
         suggestion = item.get("suggestion")
         if isinstance(suggestion, str):
@@ -297,8 +299,8 @@ def normalize_file_review(data: dict, file_path: str) -> dict:
             "file": file_path,  # from the request, never from the model
             "line_start": line_start,
             "line_end": _as_int(item.get("line_end")) or line_start,
-            "title": _as_text(item.get("title")) or "Untitled finding",
-            "description": _as_text(item.get("description")),
+            "title": title if _has_words(title) else _first_sentence(description),
+            "description": description,
             "impact": _as_text(item.get("impact")),
             "evidence": evidence,
             "category": item.get("category") if item.get("category") in CATEGORIES else "correctness",
@@ -327,6 +329,16 @@ def _normalize_walkthrough(data: dict) -> dict:
             for c in changes if isinstance(c, dict)
         ],
     }
+
+
+def _has_words(text: str) -> bool:
+    return any(ch.isalnum() for ch in text)
+
+
+def _first_sentence(text: str, limit: int = 80) -> str:
+    """A title made from the description, for a finding that came without a usable one."""
+    sentence = re.split(r"(?<=[.!?])\s", text, maxsplit=1)[0]
+    return sentence if len(sentence) <= limit else sentence[:limit - 1].rstrip() + "…"
 
 
 def _as_int(value) -> int | None:

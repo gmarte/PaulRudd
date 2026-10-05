@@ -45,12 +45,14 @@ _SEVERITY_RANK = {"critical": 0, "major": 1, "minor": 2, "suggestion": 3}
 
 # How much to show, most first: (findings with full details, findings in the fix prompt).
 # Each value is "all", "blocking" (at or above the threshold) or "none". Blocking
-# findings keep their explanation longest, since they are the ones a reviewer must act on.
+# findings keep their explanation and their place in the fix prompt longest, since
+# they are the ones a reviewer must act on; the prompt outlasts even their details,
+# because it carries them in a form a coding agent can apply.
 _DETAIL_LEVELS = (
     ("all", "all"),
     ("all", "blocking"),
-    ("all", "none"),
     ("blocking", "blocking"),
+    ("none", "blocking"),
     ("blocking", "none"),
     ("none", "none"),
 )

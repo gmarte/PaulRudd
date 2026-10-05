@@ -142,6 +142,23 @@ def test_busy_reviews_keep_details_for_blocking_findings():
     assert "Prompt for the blocking issues" in body
 
 
+def test_the_fix_prompt_for_blocking_issues_outlasts_minor_details():
+    # Live run on #404 (38 findings, 11 major): the comment kept every minor finding's
+    # explanation and dropped the prompt for fixing the blocking ones, which teams used.
+    def finding(title, severity, line, words, fix_words):
+        return _issue(title, severity, line=line, description="Descripción del problema. " * words,
+                      impact="Impacto concreto. " * 10,
+                      suggestion={"explanation": "Cómo arreglarlo. " * fix_words, "autofix": None})
+
+    # Sized so that every finding's details fit, but not together with the prompt.
+    issues = ([finding(f"Major {i}", "major", i, 30, 40) for i in range(11)]
+              + [finding(f"Minor {i}", "minor", 100 + i, 22, 10) for i in range(27)])
+    body = render.format_comment(_result(issues), _ctx("block"))
+    assert len(body) <= render.MAX_COMMENT_CHARS
+    assert "Prompt for the blocking issues" in body
+    assert body.count("<summary>🟠 [Major]") == 11 and body.count("- 🟡 [Minor]") == 27
+
+
 def test_not_reviewed_files_are_listed_with_reasons():
     ctx = _ctx("fail")
     ctx["coverage"].fail("big.sql", "too_large")
