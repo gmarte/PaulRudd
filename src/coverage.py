@@ -4,7 +4,7 @@ The coverage ledger: what happened to every changed file in the PR.
 A file is either reviewed, skipped by design (excluded, deleted, binary), or
 failed. A failed file had changes that nobody reviewed, so it makes the review
 incomplete, and an incomplete review never passes the gate unless
-on_incomplete is neutral.
+on_incomplete is neutral and every failure is one it excuses.
 """
 
 from collections import Counter
@@ -29,7 +29,14 @@ FAIL_LABELS = {
     "refused": "LLM declined to review it",
     "llm_rejected": "LLM rejected the request",
     "time_budget": "time_budget_minutes ran out before this file",
+    "budget": "budget limit reached (budget.max_files or budget.max_cost_usd)",
+    "internal_error": "Paul hit an unexpected error (see the job log)",
 }
+
+# The only failures on_incomplete: neutral excuses: the provider stayed down. A PR's
+# author could cause any other (huge or padded diffs, content that makes the model
+# refuse or answer badly) to keep a file away from review.
+NEUTRAL_REASONS = {"llm_unavailable"}
 
 
 class Coverage:
@@ -62,6 +69,11 @@ class Coverage:
     @property
     def complete(self) -> bool:
         return self.failed_count == 0
+
+    @property
+    def excusable(self) -> bool:
+        """True when every unreviewed file failed for a reason on_incomplete: neutral covers."""
+        return not self.unlisted and all(reason in NEUTRAL_REASONS for _, reason in self.failed)
 
     def skip_counts(self) -> Counter:
         return Counter(reason for _, reason in self.skipped)

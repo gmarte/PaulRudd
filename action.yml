@@ -19,6 +19,35 @@ inputs:
     required: false
     default: ".paul.yml"
 
+outputs:
+  verdict:
+    description: "pass, block, fail (incomplete), neutral (incomplete, passing) or error."
+    value: ${{ steps.paul.outputs.verdict }}
+  highest_severity:
+    description: "The most severe finding: critical, major, minor or suggestion."
+    value: ${{ steps.paul.outputs.highest_severity }}
+  findings:
+    description: "How many findings the review reported."
+    value: ${{ steps.paul.outputs.findings }}
+  reviewed_files:
+    description: "Files reviewed."
+    value: ${{ steps.paul.outputs.reviewed_files }}
+  skipped_files:
+    description: "Files skipped by design (excluded, deleted, binary)."
+    value: ${{ steps.paul.outputs.skipped_files }}
+  failed_files:
+    description: "Files with changes that could not be reviewed."
+    value: ${{ steps.paul.outputs.failed_files }}
+  cost_usd:
+    description: "Estimated LLM cost of the run, when the model's prices are known."
+    value: ${{ steps.paul.outputs.cost_usd }}
+  cache_hit_ratio:
+    description: "Share of input tokens read from the prompt cache."
+    value: ${{ steps.paul.outputs.cache_hit_ratio }}
+  comment_url:
+    description: "Link to Paul's summary comment on the PR."
+    value: ${{ steps.paul.outputs.comment_url }}
+
 runs:
   using: "composite"
   steps:
@@ -31,26 +60,54 @@ runs:
         python-version: "3.12"
         update-environment: false
 
-    # Installs into a private venv from the hash-locked requirements: every
-    # package version is pinned and its hash checked, so a tampered release on
-    # PyPI fails the install instead of running next to the job's tokens.
-    - name: Install dependencies
+    # Installs into a private venv from hash-locked requirements: every package
+    # version is pinned and its hash checked, so a tampered release on PyPI fails
+    # the install instead of running next to the job's tokens. The installs run
+    # isolated (-I) from the runner's temp directory: `python -m` would otherwise
+    # import a pip/ or venv/ package from the workspace, which holds the PR's code
+    # when the calling job checks it out.
+    - name: Install Paul
       id: deps
       shell: bash
+      working-directory: ${{ runner.temp }}
       env:
         PYTHON: ${{ steps.python.outputs.python-path }}
         LOCK_FILE: ${{ github.action_path }}/requirements.lock
       run: |
-        "$PYTHON" -m venv "$RUNNER_TEMP/paul-venv"
+        "$PYTHON" -I -m venv "$RUNNER_TEMP/paul-venv"
         if [ "$RUNNER_OS" = "Windows" ]; then
           VENV_PYTHON="$RUNNER_TEMP/paul-venv/Scripts/python.exe"
         else
           VENV_PYTHON="$RUNNER_TEMP/paul-venv/bin/python"
         fi
-        "$VENV_PYTHON" -m pip install --quiet --disable-pip-version-check --require-hashes -r "$LOCK_FILE"
+        "$VENV_PYTHON" -I -m pip install --quiet --disable-pip-version-check --require-hashes -r "$LOCK_FILE"
         echo "python=$VENV_PYTHON" >> "$GITHUB_OUTPUT"
 
+    # Claude goes through the Anthropic SDK; LiteLLM is installed only for OpenAI and Gemini.
+    - name: Check the LLM provider
+      id: provider
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        PAUL_CONFIG_PATH: ${{ inputs.config_path }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PAUL_PYTHON: ${{ steps.deps.outputs.python }}
+        PAUL_SRC: ${{ github.action_path }}/src
+      run: '"$PAUL_PYTHON" "$PAUL_SRC/provider.py"'
+
+    - name: Install LiteLLM
+      if: steps.provider.outputs.provider != 'anthropic'
+      shell: bash
+      working-directory: ${{ runner.temp }}
+      env:
+        PAUL_PYTHON: ${{ steps.deps.outputs.python }}
+        LOCK_FILE: ${{ github.action_path }}/requirements-litellm.lock
+      run: '"$PAUL_PYTHON" -I -m pip install --quiet --disable-pip-version-check --require-hashes -r "$LOCK_FILE"'
+
     - name: Run Paul
+      id: paul
       shell: bash
       working-directory: ${{ github.workspace }}
       env:

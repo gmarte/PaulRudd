@@ -38,8 +38,12 @@ def api_url(path: str) -> str:
     return f"{base}/{path.lstrip('/')}"
 
 
-def request(method: str, url: str, accept: str = "application/vnd.github+json", **kwargs) -> requests.Response:
-    """Send a GitHub API request, retrying 5xx responses, rate limits and dropped connections."""
+def request(method: str, url: str, accept: str = "application/vnd.github+json", max_wait: float = MAX_RETRY_WAIT,
+            **kwargs) -> requests.Response:
+    """
+    Send a GitHub API request, retrying 5xx responses, rate limits and dropped
+    connections. A retry that would mean waiting more than max_wait seconds fails instead.
+    """
     headers = {
         "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
         "Accept": accept,
@@ -56,7 +60,7 @@ def request(method: str, url: str, accept: str = "application/vnd.github+json", 
             print(f"  GitHub API connection failed ({type(e).__name__}); retrying in {2 ** attempt}s...")
             time.sleep(2 ** attempt)
             continue
-        delay = _retry_delay(response, attempt)
+        delay = _retry_delay(response, attempt, max_wait)
         if delay is None or attempt == MAX_ATTEMPTS:
             break
         print(f"  GitHub API returned {response.status_code}; retrying in {delay:.0f}s...")
@@ -65,7 +69,7 @@ def request(method: str, url: str, accept: str = "application/vnd.github+json", 
     return response
 
 
-def _retry_delay(response: requests.Response, attempt: int) -> float | None:
+def _retry_delay(response: requests.Response, attempt: int, max_wait: float = MAX_RETRY_WAIT) -> float | None:
     """
     Seconds to wait before retrying, or None if the response shouldn't be retried.
     Follows GitHub's guidance: honour retry-after, wait for x-ratelimit-reset when
@@ -91,7 +95,7 @@ def _retry_delay(response: requests.Response, attempt: int) -> float | None:
     else:
         wait = float(2 ** attempt)
     # Retrying before GitHub allows it would only extend the limit; give up instead.
-    return wait if wait <= MAX_RETRY_WAIT else None
+    return wait if wait <= max_wait else None
 
 
 def get_paginated(url: str, params: dict | None = None) -> list:
@@ -130,11 +134,12 @@ def list_pr_files() -> list:
     return get_paginated(api_url(f"repos/{_repo()}/pulls/{_pr_number()}/files"))
 
 
-def get_file_at(path: str, ref: str) -> str | None:
+def get_file_at(path: str, ref: str, max_wait: float = MAX_RETRY_WAIT) -> str | None:
     """A file's text at a commit, or None if it doesn't exist there."""
     url = api_url(f"repos/{_repo()}/contents/{quote(path)}")
     try:
-        response = request("GET", url, accept="application/vnd.github.raw+json", params={"ref": ref})
+        response = request("GET", url, accept="application/vnd.github.raw+json", params={"ref": ref},
+                           max_wait=max_wait)
     except requests.HTTPError as e:
         if _status(e) == 404:
             return None
@@ -217,7 +222,7 @@ def submit_review(body: str) -> None:
         payload["commit_id"] = head_sha
     try:
         request("POST", api_url(f"repos/{_repo()}/pulls/{_pr_number()}/reviews"), json=payload)
-    except requests.HTTPError as e:
+    except requests.RequestException as e:
         print(f"::warning::Could not submit the review ({e}). The job's exit code still enforces the gate.")
 
 
@@ -237,5 +242,5 @@ def dismiss_stale_change_requests() -> None:
                     "event": "DISMISS",
                 })
                 print(f"  Dismissed Paul's earlier change request (review {review['id']}).")
-    except requests.HTTPError as e:
+    except requests.RequestException as e:
         print(f"::warning::Could not dismiss Paul's earlier change requests ({e}).")

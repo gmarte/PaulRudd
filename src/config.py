@@ -37,11 +37,15 @@ DEFAULT_EXCLUDED_DIRS = [
 ]
 
 DEFAULTS = {
+    "version": 2,
     "provider": "anthropic",
-    "model": "claude-sonnet-4-6",
-    "max_tokens": 16000,
+    "model": "claude-sonnet-5-5",
+    "max_tokens": 16000,            # per response; max_output_tokens is accepted as an alias
     "temperature": None,            # only sent when set, and only to models that accept it
+    "effort": "medium",             # low | medium | high | xhigh | max; one value per run
+    "concurrency": 4,               # files reviewed at once
     "severity_threshold": "major",  # critical | major | minor
+    "min_confidence_to_block": "medium",  # low | medium | high: less confident findings are shown, not blocking
     "excluded_paths": [],
     "exclude_defaults": True,
     "custom_instructions": "",
@@ -49,12 +53,29 @@ DEFAULTS = {
     "on_incomplete": "fail",        # fail | neutral: what to do when files couldn't be reviewed
     "forks": "skip",                # skip | fail: fork/Dependabot PRs, which get no API key
     "time_budget_minutes": 45,      # stop and report before the job's timeout kills the run
+    "cache": {
+        "ttl": "5m",                # 5m | 1h for the rules and repo-context blocks
+    },
+    "review": {
+        "diff_context": "auto",     # full | compact | auto: every call sees the whole PR diff when it fits
+        "pr_context_max_tokens": 80000,
+    },
+    "budget": {
+        "max_files": 300,           # files beyond this aren't reviewed (and are reported)
+        "max_cost_usd": 5.0,        # no new LLM calls once the run's estimated cost reaches this
+    },
 }
+_SECTIONS = ("cache", "review", "budget")
+_ALIASES = {"max_output_tokens": "max_tokens"}
 
 VALID_PROVIDERS = {"anthropic", "openai", "google"}
 VALID_SEVERITIES = {"critical", "major", "minor"}
+VALID_CONFIDENCES = {"low", "medium", "high"}
 VALID_ON_INCOMPLETE = {"fail", "neutral"}
 VALID_FORKS = {"skip", "fail"}
+VALID_EFFORTS = {"", "low", "medium", "high", "xhigh", "max"}
+VALID_TTLS = {"5m", "1h"}
+VALID_DIFF_CONTEXT = {"auto", "full", "compact"}
 
 GUIDELINE_FILES = ["CLAUDE.md", "README.md"]
 AGENTS_RULES_DIR = ".agents/rules"
@@ -101,19 +122,40 @@ def is_trusted_path(path: str, config_path: str) -> bool:
     return path.startswith(rules_prefix) and path.endswith(".md") and "/" not in path[len(rules_prefix):]
 
 
+def configured_provider() -> str:
+    """Just the provider from .paul.yml, for the install step that decides whether LiteLLM is needed."""
+    text = read_repo_file(os.environ.get("PAUL_CONFIG_PATH", ".paul.yml"))
+    user_config = (yaml.safe_load(text) if text else None) or {}
+    provider = user_config.get("provider") if isinstance(user_config, dict) else None
+    return provider if provider in VALID_PROVIDERS else DEFAULTS["provider"]
+
+
 def load_config() -> dict:
     config_path = os.environ.get("PAUL_CONFIG_PATH", ".paul.yml")
 
-    config = dict(DEFAULTS)
+    config = {k: dict(v) if isinstance(v, dict) else v for k, v in DEFAULTS.items()}
 
     text = read_repo_file(config_path)
     if text:
         user_config = yaml.safe_load(text) or {}
         if not isinstance(user_config, dict):
             raise ValueError(f"{config_path} must be a YAML mapping of settings")
+        for alias, key in _ALIASES.items():
+            if alias in user_config:
+                user_config.setdefault(key, user_config.pop(alias))
         for key in sorted(set(user_config) - set(DEFAULTS)):
             print(f"::warning::Ignoring unknown setting '{key}' in {config_path}.")
-        config.update({k: v for k, v in user_config.items() if k in DEFAULTS and v is not None})
+        for key, value in user_config.items():
+            if key not in DEFAULTS or value is None:
+                continue
+            if key in _SECTIONS:
+                if not isinstance(value, dict):
+                    raise ValueError(f"{key} must be a mapping of settings")
+                for sub in sorted(set(value) - set(DEFAULTS[key])):
+                    print(f"::warning::Ignoring unknown setting '{key}.{sub}' in {config_path}.")
+                config[key].update({k: v for k, v in value.items() if k in DEFAULTS[key] and v is not None})
+            else:
+                config[key] = value
 
     _normalize(config)
     _validate(config)
@@ -142,6 +184,7 @@ def _validate(config: dict) -> None:
     for key, valid in (
         ("provider", VALID_PROVIDERS),
         ("severity_threshold", VALID_SEVERITIES),
+        ("min_confidence_to_block", VALID_CONFIDENCES),
         ("on_incomplete", VALID_ON_INCOMPLETE),
         ("forks", VALID_FORKS),
     ):
@@ -155,11 +198,34 @@ def _validate(config: dict) -> None:
     if not _is_int(config["time_budget_minutes"]) or config["time_budget_minutes"] < 1:
         raise ValueError("time_budget_minutes must be a whole number of minutes, at least 1")
 
+    if not isinstance(config["effort"], str) or config["effort"] not in VALID_EFFORTS:
+        raise ValueError(f"effort must be one of: {', '.join(sorted(VALID_EFFORTS - {''}))}")
+
+    if not _is_int(config["concurrency"]) or not 1 <= config["concurrency"] <= 16:
+        raise ValueError("concurrency must be a whole number from 1 to 16")
+
+    if config["cache"]["ttl"] not in VALID_TTLS:
+        raise ValueError(f"cache.ttl must be one of: {', '.join(sorted(VALID_TTLS))}")
+
+    review = config["review"]
+    if review["diff_context"] not in VALID_DIFF_CONTEXT:
+        raise ValueError(f"review.diff_context must be one of: {', '.join(sorted(VALID_DIFF_CONTEXT))}")
+    if not _is_int(review["pr_context_max_tokens"]) or review["pr_context_max_tokens"] < 1000:
+        raise ValueError("review.pr_context_max_tokens must be a whole number, at least 1000")
+
+    budget = config["budget"]
+    if not _is_int(budget["max_files"]) or budget["max_files"] < 1:
+        raise ValueError("budget.max_files must be a whole number, at least 1")
+    if isinstance(budget["max_cost_usd"], bool) or not isinstance(budget["max_cost_usd"], (int, float)) \
+            or budget["max_cost_usd"] <= 0:
+        raise ValueError("budget.max_cost_usd must be a positive number")
+
     temperature = config["temperature"]
+    highest = 1 if config["provider"] == "anthropic" else 2  # the Claude API accepts 0-1
     if temperature is not None and (
-        isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not 0 <= temperature <= 2
+        isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not 0 <= temperature <= highest
     ):
-        raise ValueError("temperature must be a number between 0 and 2")
+        raise ValueError(f"temperature must be a number between 0 and {highest} for the {config['provider']} provider")
 
     if not isinstance(config["excluded_paths"], list) or not all(isinstance(p, str) for p in config["excluded_paths"]):
         raise ValueError("excluded_paths must be a list of glob patterns")

@@ -1,15 +1,15 @@
 """
-Shared fixtures: an in-memory GitHub API, a scripted stand-in for
-litellm.completion, and a clean environment for every test.
+Shared fixtures: an in-memory GitHub API, a scripted stand-in for the Claude
+transport (llm_anthropic.send), and a clean environment for every test.
 """
 
 import json
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
-from types import SimpleNamespace
 from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
@@ -19,7 +19,8 @@ os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import github_client  # noqa: E402
-import reviewer  # noqa: E402
+import llm as llm_core  # noqa: E402  (`llm` is the fake's fixture name)
+import llm_anthropic  # noqa: E402
 
 REPO = "acme/shop"
 PR = "7"
@@ -78,6 +79,7 @@ class FakeGitHub:
     def __init__(self):
         self.pr_files = []
         self.base_files = {}       # path -> text at BASE_SHA
+        self.head_files = {}       # path -> text at HEAD_SHA
         self.comments = []         # {"id", "body", "user": {"type"}}
         self.reviews = []          # existing reviews on the PR
         self.submitted_reviews = []
@@ -131,11 +133,13 @@ class FakeGitHub:
         return make_response(200, json_body=items[(page - 1) * per_page: page * per_page], headers=headers, url=url)
 
     def _contents(self, path, query, url):
-        assert query.get("ref") == BASE_SHA, "trusted files must be read at the base commit"
-        if path in self.base_files:
-            return make_response(200, text=self.base_files[path], url=url)
+        ref = query.get("ref")
+        assert ref in (BASE_SHA, HEAD_SHA), "files must be read at the base or head commit"
+        files = self.base_files if ref == BASE_SHA else self.head_files
+        if path in files:
+            return make_response(200, text=files[path], url=url)
         prefix = path.rstrip("/") + "/"
-        names = sorted(p[len(prefix):] for p in self.base_files if p.startswith(prefix) and "/" not in p[len(prefix):])
+        names = sorted(p[len(prefix):] for p in files if p.startswith(prefix) and "/" not in p[len(prefix):])
         if names:
             return make_response(200, json_body=[{"name": n, "type": "file"} for n in names], url=url)
         return make_response(404, json_body={"message": "Not Found"}, url=url)
@@ -160,15 +164,11 @@ class FakeGitHub:
 # ── LLM ──────────────────────────────────────────────────────────────────────
 
 def llm_response(content, finish_reason="stop", prompt_tokens=1200, cache_read=0, completion_tokens=150):
-    usage = SimpleNamespace(
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        cache_read_input_tokens=cache_read,
-        cache_creation_input_tokens=0,
-        prompt_tokens_details=None,
-    )
-    message = SimpleNamespace(content=content)
-    return SimpleNamespace(choices=[SimpleNamespace(finish_reason=finish_reason, message=message)], usage=usage)
+    """A transport reply (finish_reason uses the old names: stop, length, content_filter)."""
+    stop = {"length": "max_tokens", "content_filter": "refusal"}.get(finish_reason, "end")
+    fresh = max(prompt_tokens - cache_read, 0)
+    return llm_core.Reply(content, stop, llm_core.Usage(fresh_input=fresh, cache_read=cache_read, output=completion_tokens,
+                                                        cost_usd=0.001))
 
 
 def review_json(*issues, resolved=(), test_recommendations=()):
@@ -181,40 +181,38 @@ def review_json(*issues, resolved=(), test_recommendations=()):
 
 class FakeLLM:
     """
-    Stands in for litellm.completion. Walkthrough calls are answered by
-    `walkthrough(kwargs)`; file reviews by `review(label, kwargs)`, where label is
-    the "Review only this file: ..." text. Either may return a response or raise.
+    Stands in for the Claude transport (llm_anthropic.send). Walkthrough calls are
+    answered by `walkthrough(plan)`; file reviews by `review(label, plan)`, where
+    label is the "Review only this file: ..." text. Either may return a reply or raise.
     """
 
     def __init__(self):
-        self.calls = []
-        self.walkthrough = lambda kwargs: llm_response(json.dumps({"summary": "Adds invoice search.", "changes": []}))
-        self.review = lambda label, kwargs: llm_response(review_json())
+        self.calls = []  # the PromptPlan of every call
+        self.walkthrough = lambda plan: llm_response(json.dumps({"summary": "Adds invoice search.", "changes": []}))
+        self.review = lambda label, plan: llm_response(review_json())
+        self._lock = threading.Lock()
 
-    def __call__(self, **kwargs):
-        self.calls.append(kwargs)
-        if "high-level walkthrough" in self.system_text(kwargs):
-            return self.walkthrough(kwargs)
-        return self.review(self.label(kwargs), kwargs)
-
-    @staticmethod
-    def system_text(kwargs):
-        content = kwargs["messages"][0]["content"]
-        return content if isinstance(content, str) else content[0]["text"]
+    def __call__(self, plan, config, timeout):
+        with self._lock:
+            self.calls.append(plan)
+        if plan.task.startswith("TASK: walkthrough"):
+            return self.walkthrough(plan)
+        return self.review(self.label(plan), plan)
 
     @staticmethod
-    def label(kwargs):
-        return re.search(r"Review only this file: (.+)", kwargs["messages"][1]["content"]).group(1).strip()
+    def label(plan):
+        return re.search(r"Review only this file: (.+)", plan.task).group(1).strip()
 
     def review_labels(self):
-        return [self.label(c) for c in self.calls if "high-level walkthrough" not in self.system_text(c)]
+        return [self.label(p) for p in self.calls if not p.task.startswith("TASK: walkthrough")]
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
 @pytest.fixture(autouse=True)
 def env(monkeypatch, tmp_path):
-    for key in _KEY_VARS + ("PAUL_CONFIG_PATH", "RUNNER_DEBUG", "GITHUB_API_URL", "GITHUB_RUN_ID", "GITHUB_EVENT_NAME"):
+    for key in _KEY_VARS + ("PAUL_CONFIG_PATH", "RUNNER_DEBUG", "GITHUB_API_URL", "GITHUB_RUN_ID", "GITHUB_EVENT_NAME",
+                            "GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY", "ANTHROPIC_BASE_URL"):
         monkeypatch.setenv(key, "")
         monkeypatch.delenv(key)
     monkeypatch.setenv("GITHUB_TOKEN", "ghs_test")
@@ -226,12 +224,13 @@ def env(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     write_event(monkeypatch, tmp_path)
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
-    for key in reviewer.USAGE:
-        reviewer.USAGE[key] = 0
-    reviewer._render_prompt.cache_clear()
-    reviewer.set_deadline(None)
+    llm_core.reset_run()
+    llm_core.set_deadline(None)
+    llm_core.set_log_prefix("")
+    llm_anthropic.reset()
     yield
-    reviewer.set_deadline(None)
+    llm_core.set_deadline(None)
+    llm_core.set_log_prefix("")
 
 
 def write_event(monkeypatch, tmp_path, **pull_request):
@@ -261,7 +260,7 @@ def gh(monkeypatch):
 @pytest.fixture
 def llm(monkeypatch):
     fake = FakeLLM()
-    monkeypatch.setattr(reviewer.litellm, "completion", fake)
+    monkeypatch.setattr(llm_anthropic, "send", fake)
     return fake
 
 

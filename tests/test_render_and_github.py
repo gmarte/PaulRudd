@@ -142,6 +142,23 @@ def test_busy_reviews_keep_details_for_blocking_findings():
     assert "Prompt for the blocking issues" in body
 
 
+def test_the_fix_prompt_for_blocking_issues_outlasts_minor_details():
+    # Live run on #404 (38 findings, 11 major): the comment kept every minor finding's
+    # explanation and dropped the prompt for fixing the blocking ones, which teams used.
+    def finding(title, severity, line, words, fix_words):
+        return _issue(title, severity, line=line, description="Descripción del problema. " * words,
+                      impact="Impacto concreto. " * 10,
+                      suggestion={"explanation": "Cómo arreglarlo. " * fix_words, "autofix": None})
+
+    # Sized so that every finding's details fit, but not together with the prompt.
+    issues = ([finding(f"Major {i}", "major", i, 30, 40) for i in range(11)]
+              + [finding(f"Minor {i}", "minor", 100 + i, 22, 10) for i in range(27)])
+    body = render.format_comment(_result(issues), _ctx("block"))
+    assert len(body) <= render.MAX_COMMENT_CHARS
+    assert "Prompt for the blocking issues" in body
+    assert body.count("<summary>🟠 [Major]") == 11 and body.count("- 🟡 [Minor]") == 27
+
+
 def test_not_reviewed_files_are_listed_with_reasons():
     ctx = _ctx("fail")
     ctx["coverage"].fail("big.sql", "too_large")
@@ -232,12 +249,44 @@ def test_secondary_rate_limits_wait_a_minute(monkeypatch):
     assert github_client._retry_delay(too_long, 1) is None  # give up rather than retry early
     forbidden = make_response(403, json_body={"message": "Resource not accessible by integration"})
     assert github_client._retry_delay(forbidden, 1) is None
+    assert github_client._retry_delay(limited, 1, max_wait=30) is None  # a caller that can't wait that long
 
 
-def test_review_submission_failures_are_warnings(gh, capsys):
+def test_a_files_text_is_not_worth_a_long_rate_limit_wait(gh, monkeypatch):
+    # Review finding: fetching each file's text could sit out 300-second rate-limit waits past the time budget.
+    waits = []
+    monkeypatch.setattr(github_client.time, "sleep", waits.append)
+    gh.queued[("GET", "/repos/acme/shop/contents/app/views.py")] = [429]
+    with pytest.raises(requests.HTTPError):
+        github_client.get_file_at("app/views.py", "c" * 40, max_wait=30)
+    assert waits == []
+
+
+def test_review_submission_failures_are_warnings(gh, capsys, monkeypatch):
     gh.queued[("POST", "/repos/acme/shop/pulls/7/reviews")] = [422]
     github_client.submit_review("Paul found 0 issue(s).")
     assert "::warning::Could not submit the review" in capsys.readouterr().out
+
+    # Review finding: a dropped connection here used to replace a published review with a failure notice.
+    def dropped(method, url, **kwargs):
+        raise requests.ConnectionError("reset")
+
+    monkeypatch.setattr(github_client._session, "request", dropped)
+    github_client.submit_review("Paul found 0 issue(s).")
+    github_client.dismiss_stale_change_requests()
+    out = capsys.readouterr().out
+    assert "Could not submit the review" in out and "Could not dismiss" in out
+
+
+def test_neutral_excuses_only_provider_outages():
+    coverage = Coverage()
+    coverage.fail("a.py", "llm_unavailable")
+    assert coverage.excusable
+    coverage.fail("b.py", "invalid_output")
+    assert not coverage.excusable
+    unlisted = Coverage()
+    unlisted.fail_unlisted(3, "over_file_limit")
+    assert not unlisted.excusable
 
 
 def test_missing_files_at_the_base_commit_are_none(gh):
@@ -253,3 +302,22 @@ def test_other_http_errors_propagate(gh):
         assert e.response.status_code == 401
     else:
         raise AssertionError("expected an HTTPError")
+
+
+def test_the_job_summary_reports_verdict_files_cache_and_cost():
+    outputs = {"verdict": "block", "findings": "3", "highest_severity": "major", "reviewed_files": "5",
+               "skipped_files": "1", "failed_files": "0", "cost_usd": "0.4210", "cache_hit_ratio": "0.865",
+               "comment_url": "https://github.com/acme/shop/pull/7#issuecomment-1"}
+    report = render.step_summary(_ctx("block"), outputs, 0.865)
+    assert report.startswith("### Paul's review") and "**🔴 Changes needed**" in report
+    assert "| Findings | 3 (highest: major) |" in report and "| Prompt cache | 86% of input tokens" in report
+    assert "| Estimated cost | $0.42 |" in report and "[Review comment](https://github.com/acme/shop/pull/7#" in report
+
+
+def test_review_details_show_the_estimated_cost_when_known():
+    ctx = _ctx()
+    ctx["usage"] = {"calls": 3, "input_tokens": 1000, "cache_read_tokens": 800, "output_tokens": 50,
+                    "cost_usd": 0.0123, "cost_known": True}
+    assert "· 3 LLM call(s) · ≈ $0.01" in render.format_comment(_result([]), ctx)
+    ctx["usage"]["cost_known"] = False
+    assert "≈ $" not in render.format_comment(_result([]), ctx)

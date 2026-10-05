@@ -1,12 +1,17 @@
-# Direct dependencies. Edit this file, then regenerate the hash-locked
-# requirements.lock that action.yml installs:
+# Direct dependencies of the default (Claude) path. Edit this file or
+# requirements-litellm.in, then regenerate both hash-locked files:
 #
+#   uv pip compile requirements.in requirements-litellm.in --universal \
+#       --python-version 3.12 --generate-hashes -o requirements-litellm.lock
 #   uv pip compile requirements.in --universal --python-version 3.12 \
-#       --generate-hashes -o requirements.lock
+#       --generate-hashes -c requirements-litellm.lock -o requirements.lock
 #
-# LiteLLM is pinned exactly: versions 1.82.7 and 1.82.8 shipped a credential
-# stealer, so upgrade deliberately, to a release that has been out for a while.
-litellm==1.102.1
+# (The second command keeps every shared package at the same version, so
+# installing LiteLLM on top of the core lock adds packages without changing any.)
+#
+# Pin SDKs exactly and upgrade deliberately, to releases that have been out for
+# a while: LiteLLM 1.82.7 and 1.82.8 shipped a credential stealer.
+anthropic==1.8.0
 requests>=2.32,<3
 pyyaml>=6.0,<7
 pathspec>=0.12,<1

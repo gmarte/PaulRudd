@@ -16,6 +16,7 @@ import re
 
 from coverage import FAIL_LABELS, SKIP_LABELS
 from github_client import REVIEW_PREFIX, SUMMARY_MARKER
+from reviewer import blocks
 
 MAX_COMMENT_CHARS = 60_000   # GitHub rejects bodies over 65,536 characters
 _MAX_STATE_CHARS = 20_000    # budget for the hidden findings block
@@ -44,13 +45,15 @@ SEVERITY_LABEL = {
 _SEVERITY_RANK = {"critical": 0, "major": 1, "minor": 2, "suggestion": 3}
 
 # How much to show, most first: (findings with full details, findings in the fix prompt).
-# Each value is "all", "blocking" (at or above the threshold) or "none". Blocking
-# findings keep their explanation longest, since they are the ones a reviewer must act on.
+# Each value is "all", "blocking" (findings that block the merge) or "none". Blocking
+# findings keep their explanation and their place in the fix prompt longest, since
+# they are the ones a reviewer must act on; the prompt outlasts even their details,
+# because it carries them in a form a coding agent can apply.
 _DETAIL_LEVELS = (
     ("all", "all"),
     ("all", "blocking"),
-    ("all", "none"),
     ("blocking", "blocking"),
+    ("none", "blocking"),
     ("blocking", "none"),
     ("none", "none"),
 )
@@ -115,8 +118,9 @@ def format_failure(reason: str, ctx: dict) -> str:
         "",
         "Re-run the job to try again.",
     ]
-    # Keep the previous findings so the next run still knows what was reported.
-    lines += _footer(ctx, ctx.get("prior_findings", []))
+    # Keep the previous findings, with the fingerprints they were made against, so the
+    # next run still knows what was reported.
+    lines += _footer(ctx, ctx.get("prior_findings", []), ctx.get("prior_file_hashes", {}))
     return "\n".join(lines)
 
 
@@ -127,6 +131,34 @@ def review_body(result: dict, ctx: dict) -> str:
         f"{REVIEW_PREFIX} {len(issues)} issue(s). Highest severity: {result['overall_severity']}. "
         f"{_verdict_text(ctx)} See the review comment for details."
     )
+
+
+def step_summary(ctx: dict, outputs: dict, hit_ratio: float) -> str:
+    """A short report for the job's summary page ($GITHUB_STEP_SUMMARY)."""
+    verdict = {
+        "pass": "✅ No blocking issues",
+        "block": "🔴 Changes needed",
+        "fail": "⚠️ Incomplete: files could not be reviewed",
+        "neutral": "⚠️ Incomplete, passing (on_incomplete: neutral)",
+        "error": "❌ Paul could not complete the review",
+    }.get(outputs["verdict"], outputs["verdict"])
+    lines = [
+        "### Paul's review",
+        "",
+        f"**{verdict}**",
+        "",
+        "| | |",
+        "|---|---|",
+        f"| Findings | {outputs['findings']} (highest: {outputs['highest_severity'] or 'none'}) |",
+        f"| Files | {outputs['reviewed_files']} reviewed · {outputs['skipped_files']} skipped · "
+        f"{outputs['failed_files']} not reviewed |",
+        f"| Prompt cache | {hit_ratio:.0%} of input tokens read from cache |",
+    ]
+    if outputs["cost_usd"]:
+        lines.append(f"| Estimated cost | ${float(outputs['cost_usd']):.2f} |")
+    if outputs["comment_url"]:
+        lines += ["", f"[Review comment]({outputs['comment_url']})"]
+    return "\n".join(lines) + "\n"
 
 
 def code_span(text) -> str:
@@ -212,11 +244,11 @@ def _comment_lines(result: dict, ctx: dict, detailed: str, prompted: str, shown:
     lines += _walkthrough_section(result, open_=False, counts=_counts(issues))
     lines += ["", "---"]
     for issue in in_detail:
-        lines += _format_issue(issue)
+        lines += _format_issue(issue, ctx)
     if in_brief:
         if in_detail:
             lines += ["", "**Other findings**"]
-        lines += _compact_issues(in_brief)
+        lines += _compact_issues(in_brief, ctx)
     if len(shown) < len(issues):
         lines += ["", f"*…and {len(issues) - len(shown)} more finding(s) that didn't fit in this comment. "
                       f"Every finding is listed in the run logs.*"]
@@ -235,8 +267,23 @@ def _selected(issue: dict, which: str, ctx: dict) -> bool:
     if which == "all":
         return True
     if which == "blocking":
-        return _SEVERITY_RANK[issue["severity"]] <= _SEVERITY_RANK[ctx["threshold"]]
+        return _blocks(issue, ctx)
     return False
+
+
+def _blocks(issue: dict, ctx: dict) -> bool:
+    return blocks(issue, ctx["threshold"], ctx.get("min_confidence", "medium"))
+
+
+def _label(issue: dict, ctx: dict) -> str:
+    """'🟠 [Major]', with the confidence when it is low or kept a finding from blocking."""
+    sev, confidence = issue["severity"], issue.get("confidence") or "medium"
+    label = SEVERITY_LABEL[sev]
+    if _SEVERITY_RANK[sev] <= _SEVERITY_RANK[ctx["threshold"]] and not _blocks(issue, ctx):
+        label += f" · {confidence} confidence, not blocking"
+    elif confidence == "low":
+        label += " · low confidence"
+    return f"{SEVERITY_EMOJI[sev]} [{label}]"
 
 
 def _state_findings(result: dict) -> list:
@@ -251,9 +298,17 @@ def _verdict_text(ctx: dict) -> str:
     if outcome == "block":
         return f"🔴 Changes needed: findings at or above the `{threshold}` threshold."
     if outcome == "fail":
+        if ctx.get("on_incomplete") == "neutral":
+            return (f"⚠️ Incomplete: {failed:,} file(s) could not be reviewed, so this check fails: "
+                    f"`on_incomplete: neutral` only excuses files the LLM provider couldn't answer for.")
         return f"⚠️ Incomplete: {failed:,} file(s) could not be reviewed, so this check fails (`on_incomplete: fail`)."
     if outcome == "neutral":
         return f"⚠️ Incomplete: {failed:,} file(s) could not be reviewed; passing because `on_incomplete: neutral`."
+    unsure = [i for i in (ctx.get("result") or {}).get("issues", [])
+              if _SEVERITY_RANK[i["severity"]] <= _SEVERITY_RANK[threshold] and not _blocks(i, ctx)]
+    if unsure:
+        return (f"✅ No blocking issues (threshold: `{threshold}`). {len(unsure):,} finding(s) at or above it are "
+                f"below `min_confidence_to_block: {ctx.get('min_confidence', 'medium')}`, so they don't block.")
     return f"✅ No blocking issues (threshold: `{threshold}`)."
 
 
@@ -324,9 +379,8 @@ def _walkthrough_section(walkthrough: dict, open_: bool, counts: dict | None = N
     return lines
 
 
-def _format_issue(issue: dict) -> list:
-    sev = issue["severity"]
-    summary_line = (f"{SEVERITY_EMOJI[sev]} [{SEVERITY_LABEL[sev]}] {_summary_html(issue['title'])} — "
+def _format_issue(issue: dict, ctx: dict) -> list:
+    summary_line = (f"{html.escape(_label(issue, ctx))} {_summary_html(issue['title'])} — "
                     f"<code>{html.escape(_location_text(issue))}</code>")
 
     # One paragraph per field, so markup in one field can't run into the next.
@@ -341,12 +395,10 @@ def _format_issue(issue: dict) -> list:
     return ["", "<details>", f"<summary>{summary_line}</summary>", ""] + body + ["</details>"]
 
 
-def _compact_issues(issues: list) -> list:
+def _compact_issues(issues: list, ctx: dict) -> list:
     lines = [""]
     for issue in issues:
-        sev = issue["severity"]
-        lines.append(f"- {SEVERITY_EMOJI[sev]} [{SEVERITY_LABEL[sev]}] {_escape(issue['title'])} — "
-                     f"{code_span(_location_text(issue))}")
+        lines.append(f"- {_label(issue, ctx)} {_escape(issue['title'])} — {code_span(_location_text(issue))}")
     return lines
 
 
@@ -391,22 +443,23 @@ def _details_section(ctx: dict) -> list:
     if ctx.get("head_sha"):
         lines.append(f"- **Commit:** {code_span(ctx['head_sha'][:7])}")
     if usage.get("calls"):
+        cost = f" · ≈ ${usage['cost_usd']:.2f}" if usage.get("cost_known") else ""
         lines.append(
             f"- **Tokens:** {usage['input_tokens']:,} in ({usage['cache_read_tokens']:,} read from cache) · "
-            f"{usage['output_tokens']:,} out · {usage['calls']} LLM call(s)"
+            f"{usage['output_tokens']:,} out · {usage['calls']} LLM call(s){cost}"
         )
     if ctx.get("run_url"):
         lines.append(f"- **Run:** [logs]({ctx['run_url']})")
     return lines + ["", "</details>"]
 
 
-def _footer(ctx: dict, state_issues: list) -> list:
+def _footer(ctx: dict, state_issues: list, file_hashes: dict | None = None) -> list:
     return [
         "",
         "---",
         FOOTER.format(model=_code(ctx.get("model", "unknown model"))),
         SUMMARY_MARKER,
-        encode_state(state_issues, ctx.get("file_hashes", {})),
+        encode_state(state_issues, ctx.get("file_hashes", {}) if file_hashes is None else file_hashes),
     ]
 
 

@@ -1,0 +1,2 @@
+# Installed on top of requirements.lock only when provider is openai or google.
+litellm==1.102.1

@@ -1,15 +1,18 @@
 # Paul reviewing Paul: settings for this repository's own PRs.
 provider: anthropic
-model: claude-sonnet-4-6
+model: claude-sonnet-5-5
 severity_threshold: major
 # A provider outage shouldn't block work on Paul itself.
 on_incomplete: neutral
 custom_instructions: |
   This repo is Paul, a GitHub Actions composite action (action.yml) written in Python 3.12 that reviews
-  pull requests with LLMs through LiteLLM. Pay special attention to:
+  pull requests with LLMs: Claude through the Anthropic SDK, OpenAI and Gemini through LiteLLM.
+  Pay special attention to:
   - The merge gate must fail closed: a file that could not be reviewed must never be counted as clean.
   - Untrusted input (diffs, PR text, LLM output) must never be executed or trusted as instructions, and
     must be escaped before it is rendered into GitHub comments.
   - GitHub API calls must handle pagination, rate limits and errors.
   - Secrets (GITHUB_TOKEN, API keys) must never reach the logs.
+  - Every LLM call in a run must share one prompt prefix (static rules, repo context, PR context):
+    per-call data belongs in the task, and the model, effort and output schema must not vary.
   - Behaviour changes need a pytest test in tests/.
